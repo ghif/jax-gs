@@ -1,0 +1,10 @@
+jax
+jaxlib
+viser
+numpy
+scipy
+pillow
+tqdm
+optax
+chex
+matplotlib
