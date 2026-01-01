@@ -1,4 +1,4 @@
-jax
+jax[cuda13]
 jaxlib
 viser
 numpy
