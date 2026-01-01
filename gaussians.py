@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 import chex
-from typing import NamedTuple
 
 @chex.dataclass
 class Gaussians:
@@ -24,13 +23,13 @@ def init_gaussians_from_pcd(points: jnp.ndarray, colors: jnp.ndarray, spatial_lr
     
     # Scales: log of the distance to the nearest neighbors (placeholder for now)
     # For simplicity, initialized to a small value
-    scales = jnp.full((num_points, 3), -5.0) 
+    scales = jnp.full((num_points, 3), -3.0) 
     
     # Rotations: identity quaternions [1, 0, 0, 0]
     quaternions = jnp.tile(jnp.array([1.0, 0.0, 0.0, 0.0]), (num_points, 1))
     
-    # Opacities: inverse sigmoid of 0.1
-    opacities = jnp.full((num_points, 1), -2.197) 
+    # Opacities: inverse sigmoid of 0.5 = 0.0
+    opacities = jnp.full((num_points, 1), 0.0) 
     
     # SH Coefficients (DC term only for now)
     # SH_DC = (R - 0.5) / 0.28209

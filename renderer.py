@@ -4,14 +4,14 @@ from typing import NamedTuple
 from gaussians import Gaussians, get_covariance_3d
 
 class Camera(NamedTuple):
-    W: int
-    H: int
-    fx: float
-    fy: float
-    cx: float
-    cy: float
-    W2C: jnp.ndarray  # (4, 4)
-    full_proj: jnp.ndarray  # (4, 4)
+    W: int      # Image width
+    H: int      # Image height
+    fx: float   # Focal length x
+    fy: float   # Focal length y
+    cx: float   # Principal point x
+    cy: float   # Principal point y
+    W2C: jnp.ndarray  # World-to-Camera matrix (4, 4)
+    full_proj: jnp.ndarray  # Full projection matrix (4, 4)
 
 def project_gaussians(gaussians: Gaussians, camera: Camera):
     """
@@ -129,11 +129,16 @@ def render(gaussians: Gaussians, camera: Camera):
             alpha = jnp.where(p < -10.0, 0.0, alpha) # Cutoff
             
             # Alpha blending: C = sum(color_i * alpha_i * T_i)
+            # Log max alpha for debugging if T is still 1.0 (everything transparent)
             new_color = accum_color + cols[i] * alpha * T
             new_T = T * (1.0 - alpha)
             
             return (new_color, new_T), None
-
+            
+        # Debugging: check stats of what we are rendering
+        # jax.debug.print("Scales min: {}, max: {}, mean: {}", jnp.min(gaussians.scales), jnp.max(gaussians.scales), jnp.mean(gaussians.scales))
+        # jax.debug.print("Opacities min: {}, max: {}, mean: {}", jnp.min(gaussians.opacities), jnp.max(gaussians.opacities), jnp.mean(gaussians.opacities))
+        
         (final_color, _), _ = jax.lax.scan(step, (jnp.zeros(3), 1.0), top_indices)
         return final_color
 
