@@ -2,14 +2,43 @@
 
 A minimal, JAX-based implementation of 3D Gaussian Splatting. This repository includes scripts to train a model on the standard Fern dataset and visualize the results.
 
-## Prerequisites
+## Environment Setup (using uv)
 
-1.  **Python Environment**: Ensure you have Python 3.10+ installed.
-2.  **Dependencies**: Install the required packages.
+This project recommendeds using `uv` for fast Python package management. We suggest creating separate environments for CPU and MPS (Metal Performance Shaders) execution to handle dependency differences.
+
+1.  **Install uv** (if not already installed):
     ```bash
-    pip install -r requirements.txt
+    curl -LsSf https://astral.sh/uv/install.sh | sh
     ```
-    *Note: This implementation is optimized for CPU execution. JAX Metal (GPU) support on macOS is currently experimental and disabled by default due to version incompatibilities.*
+
+2.  **Setup CPU Environment** (`.cpu_env`):
+    Use this for standard execution or if you don't have a Mac with Apple Silicon.
+    ```bash
+    # Create virtual environment (Python 3.11 recommended)
+    uv venv .cpu_env --python 3.11
+
+    # Activate
+    source .cpu_env/bin/activate
+
+    # Install dependencies
+    uv pip install -r requirements_cpu.txt
+    ```
+
+3.  **Setup MPS (Mac GPU) Environment** (`.mps_env`):
+    Use this for accelerated training on macOS (Apple Silicon).
+    ```bash
+    # Create virtual environment
+    uv venv .mps_env --python 3.11
+
+    # Activate
+    source .mps_env/bin/activate
+
+    # Install dependencies
+    uv pip install -r requirements_mps.txt
+    ```
+
+    *Note: MPS support requires explicit `float32` enforcing which is handled by the `train_fern_mps.py` script.*
+
 
 ## Data Preparation
 
@@ -27,10 +56,18 @@ A minimal, JAX-based implementation of 3D Gaussian Splatting. This repository in
 
 ## Training
 
-To start training the Gaussian Splatting model on the Fern dataset:
-
+### CPU Training
+To start training on the CPU (using `.cpu_env`):
 ```bash
+source .cpu_env/bin/activate
 python train_fern.py
+```
+
+### MPS (Mac GPU) Training
+To start training on Mac GPU (using `.mps_env`):
+```bash
+source .mps_env/bin/activate
+python train_fern_mps.py
 ```
 
 This will:
@@ -50,6 +87,7 @@ You can visualize the trained Gaussian Splats using the included Viser-based vie
 Run the viewer with the path to a generated `.ply` file:
 
 ```bash
+# Works in either environment
 python viewer_ply.py results/fern_YYYYMMDD_HHMMSS/ply/fern_final_splats.ply
 ```
 
@@ -63,8 +101,11 @@ python viewer_ply.py results/fern_YYYYMMDD_HHMMSS/ply/fern_final_splats.ply
 
 ## Project Structure
 
-*   `train_fern.py`: Main training script.
-*   `renderer_v2.py`: Tile-based differentiable renderer implemented in JAX.
+*   `train_fern.py`: Main training script (CPU).
+*   `train_fern_mps.py`: Training script optimized for MPS (Mac GPU).
+*   `renderer_v2.py`: Tile-based differentiable renderer (JAX).
+*   `renderer_v2_mps.py`: MPS-optimized renderer with float32 enforcement and stable sorting.
 *   `viewer_ply.py`: Script to load and visualize `.ply` files.
 *   `gaussians.py`: Data structure and initialization for 3D Gaussians.
-*   `requirements.txt`: Python dependencies.
+*   `requirements_cpu.txt`: Dependencies for CPU environment.
+*   `requirements_mps.txt`: Dependencies for MPS environment.

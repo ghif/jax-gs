@@ -1,5 +1,4 @@
-jax[cuda13]
-jaxlib
+jax[cuda12]
 viser
 numpy
 scipy
