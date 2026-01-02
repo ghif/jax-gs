@@ -20,7 +20,7 @@ from functools import partial
 from renderer_v2 import Camera, render_v2 as render
 from gaussians import Gaussians, init_gaussians_from_pcd
 from utils import load_colmap_data
-from save_utils import save_ply
+from ply_utils import save_ply
 
 def l1_loss(pred, target):
     return jnp.mean(jnp.abs(pred - target))

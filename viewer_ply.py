@@ -18,7 +18,7 @@ def load_ply(path):
     # not a PLY file blob (the error message confirmed this: missing covariances, etc).
     
     # To properly load the custom PLY we made, we need to read it back.
-    # Our save_utils.py used a specific struct.
+    # Our ply_utils.py used a specific struct.
     
     # We can use a simple custom parser for binary PLY.
     
@@ -62,7 +62,7 @@ def load_ply(path):
     
     # Extract Colors (SH DC) -> Convert to RGB
     # SH DC 0 is R, DC 1 is G, DC 2 is B (approx, actually need to add 0.5 and scale)
-    # in save_utils: f_dc = (color - 0.5) / 0.282...
+    # in ply_utils: f_dc = (color - 0.5) / 0.282...
     # so color = f_dc * 0.282... + 0.5
     f_dc = data[:, [prop_map['f_dc_0'], prop_map['f_dc_1'], prop_map['f_dc_2']]]
     colors = f_dc * 0.28209479177387814 + 0.5
@@ -70,7 +70,7 @@ def load_ply(path):
     
     # Extract Scales
     scales_data = data[:, [prop_map['scale_0'], prop_map['scale_1'], prop_map['scale_2']]]
-    scales = np.exp(scales_data) # We stored log scales? save_utils says "scales = np.array(gaussians.scales)". 
+    scales = np.exp(scales_data) # We stored log scales? ply_utils says "scales = np.array(gaussians.scales)". 
     # Init code says: scales = log distance. So yes, they are log scales.
     
     # Extract Rotations (Quaternions)
