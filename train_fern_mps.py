@@ -54,6 +54,7 @@ def create_camera_objects(train_cameras):
 
 @partial(jax.jit, static_argnums=(3, 4))
 def train_step(state, target_image, w2c, optimizer, camera_static):
+    print("TRACING train_step - if you see this multiple times, it is RECOMPILING")
     params, opt_state = state
     W, H, fx, fy, cx, cy = camera_static
     

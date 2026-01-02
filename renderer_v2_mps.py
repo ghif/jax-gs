@@ -170,24 +170,61 @@ def get_tile_interactions(means2D, radii, valid_mask, depths, H, W, tile_size):
     # Replace invalid keys with high value for sorting to end
     sort_tile_ids = jnp.where(valid_interactions, flat_tile_ids, jnp.iinfo(jnp.int32).max)
     
-    # MPS Optimization: Use 2-pass stable argsort instead of lexsort or uint64 packed key
-    # Pass 1: Sort by depth (secondary key)
-    # Bitcast float32 depth to int32 to preserve order for positive depths
-    depth_i32 = jax.lax.bitcast_convert_type(flat_depths, jnp.int32)
+    # MPS Optimization: Single-pass argsort with int32 packed key
+    # Key = (tile_id << 13) | depth_quantized
+    # 13 bits for depth = 8192 levels. Sufficient for local sorting within tile.
+    # 31 - 13 = 18 bits for tile_id = 262,144 tiles.
+    # For 16x16 tiles, that supports image size ~8000x8000.
     
-    # Sort by secondary key (depth)
-    idx_s = jnp.argsort(depth_i32)
+    DEPTH_BITS = 13
     
-    # Pass 2: Sort by tile_id (primary key) using the indices from pass 1
-    # We permute the primary keys to reflect the secondary sort order
-    tile_ids_permuted = sort_tile_ids[idx_s]
+    # Quantize depth to [0, 2^DEPTH_BITS - 1]
+    # We assume reasonable depth range, or use monotonic mapping?
+    # Simple linear mapping: 
+    # To preserve order, we just need monotonic transformation.
+    # However, to pack into bits, we need integer.
+    # We can interpret float bytes as int for sorting, but we need to shift.
+    # Safer: normalize min/max or use view-space z directly?
+    # Since we sort per tile, global ordering matters for tile_id, 
+    # but for depth only local ordering matters.
+    # Actually, we just need (tile_a < tile_b) OR (tile_a == tile_b AND depth_a < depth_b).
+    #
+    # Quantizing valid depths (e.g. 0.1 to 100.0) to u13:
+    # We can clamp to a range and scale.
+    # Or bitcast? bitcast preserves order for positive floats.
+    # bitcast float32 -> int32.
+    # Shift right to keep top 13 bits?
+    # top bits of float are sign, exponent, mantissa.
+    # For positive floats, larger float = larger int rep.
+    # keeping top 13 bits retains exponent and top mantissa.
+    # That is effectively "logarithmic quantization". Very good for depth!
     
-    # Stable sort by primary key
-    # JAX argsort is stable by default
-    idx_p = jnp.argsort(tile_ids_permuted)
+    depth_i32_full = jax.lax.bitcast_convert_type(flat_depths, jnp.int32)
+    # We want top 13 bits. But we don't want negative (sign bit 31). z > 0.
+    # Shift down: 31 (sign) + 8 (exp) + 23 (mantissa).
+    # We want to keep 13 bits of "significance".
+    # int32 is 31 bits magnitude.
+    # We can't just << tile_id because tile_id needs high bits.
+    # Key layout: [TileID: 18 bits] [Depth: 13 bits]
     
-    # Combine indices: idx_s[idx_p]
-    sort_indices = idx_s[idx_p]
+    # Depth reduction:
+    # Take top 13 bits of the Int32 representation (excluding sign bit, or assume positive).
+    # depth is always positive (> 0.01).
+    # Mask out sign bit just in case: & 0x7FFFFFFF (not needed for logic shift if we cast to uint? No uint32 on MPS int32 sort?)
+    # MPS argsort works on int32.
+    # depth_i32 >> (31 - 13) = depth_i32 >> 18.
+    
+    depth_quant = depth_i32_full >> (31 - DEPTH_BITS)
+    
+    # Mask to ensure within bits (though shift handles it)
+    # depth_quant is now 13 bits (mostly exponent).
+    
+    # Pack:
+    # tile_id is int32.
+    key = (sort_tile_ids << DEPTH_BITS) | depth_quant
+    
+    # Sort
+    sort_indices = jnp.argsort(key)
     
     sorted_tile_ids = sort_tile_ids[sort_indices]
     sorted_gaussian_ids = flat_gaussian_ids[sort_indices]

@@ -1,3 +1,4 @@
+jax-metal
 jax==0.5.0
 jaxlib==0.5.0
 chex==0.1.88
