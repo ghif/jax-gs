@@ -11,6 +11,7 @@ import math
 import glob
 from functools import partial
 from PIL import Image
+import argparse
 
 # Use the standard renderer
 from renderer_v2 import Camera, render_v2 as render
@@ -48,7 +49,7 @@ def find_latest_ply():
     ply_files.sort(key=os.path.getmtime)
     return ply_files[-1]
 
-def run_training():
+def run_training(num_iterations: int = 10000):
     # 1. Load data
     path = "data/nerf_example_data/nerf_llff_data/fern"
     print(f"Loading data from {path}")
@@ -97,7 +98,6 @@ def run_training():
     state = (gaussians, opt_state)
     
     # Loop
-    num_iterations = 5000 # Let's do another 5k iterations
     pbar = tqdm(range(num_iterations))
     
     os.makedirs("results", exist_ok=True)
@@ -157,4 +157,8 @@ def run_training():
     print("Saved fern_final_splats.ply")
 
 if __name__ == "__main__":
-    run_training()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num_iterations", type=int, default=10000, help="Number of training iterations to add")
+    args = parser.parse_args()
+    
+    run_training(num_iterations=args.num_iterations)

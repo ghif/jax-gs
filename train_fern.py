@@ -15,6 +15,7 @@ import datetime
 import random
 import math
 from functools import partial
+import argparse
 
 # Use the GPU-optimized renderer
 from renderer_v2 import Camera, render_v2 as render
@@ -44,7 +45,7 @@ def train_step(state, target_image, w2c, optimizer, camera_static):
     
     return (next_params, next_opt_state), loss
 
-def run_training():
+def run_training(num_iterations: int = 10000):
     path = "data/nerf_example_data/nerf_llff_data/fern"
     print(f"Loading data from {path}")
     xyz, rgb, train_cam_infos = load_colmap_data(path, "images_8")
@@ -88,7 +89,6 @@ def run_training():
     state = (gaussians, opt_state)
     
     # Loop
-    num_iterations = 10000 
     pbar = tqdm(range(num_iterations))
     
     os.makedirs("results", exist_ok=True)
@@ -138,4 +138,8 @@ def run_training():
     print("Saved fern_final_splats.ply")
 
 if __name__ == "__main__":
-    run_training()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num_iterations", type=int, default=10000, help="Number of training iterations")
+    args = parser.parse_args()
+    
+    run_training(num_iterations=args.num_iterations)
