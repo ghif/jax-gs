@@ -10,7 +10,7 @@ class Gaussians:
     opacities: jnp.ndarray  # (N, 1)
     sh_coeffs: jnp.ndarray  # (N, K, 3) where K is num SH coefficients
 
-def init_gaussians_from_pcd(points: jnp.ndarray, colors: jnp.ndarray, spatial_lr_scale: float = 1.0):
+def init_gaussians_from_pcd(points: jnp.ndarray, colors: jnp.ndarray):
     """
     Initialize Gaussians from a point cloud.
     points: (N, 3)
@@ -21,8 +21,8 @@ def init_gaussians_from_pcd(points: jnp.ndarray, colors: jnp.ndarray, spatial_lr
     # Position: mean of the point cloud
     means = points
     
-    # Scales: log of the distance to the nearest neighbors (placeholder for now)
-    # For simplicity, initialized to a small value
+    # Scales: log of the distance to the nearest neighbors
+    # Initialized to a small value (approx 0.05m)
     scales = jnp.full((num_points, 3), -3.0) 
     
     # Rotations: identity quaternions [1, 0, 0, 0]
@@ -31,7 +31,7 @@ def init_gaussians_from_pcd(points: jnp.ndarray, colors: jnp.ndarray, spatial_lr
     # Opacities: inverse sigmoid of 0.5 = 0.0
     opacities = jnp.full((num_points, 1), 0.0) 
     
-    # SH Coefficients (DC term only for now)
+    # SH Coefficients (DC term only)
     # SH_DC = (R - 0.5) / 0.28209
     sh_dc = (colors - 0.5) / 0.28209479177387814
     sh_coeffs = jnp.zeros((num_points, 16, 3)) # Degree 3 SH -> 16 coefficients

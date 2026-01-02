@@ -1,11 +1,12 @@
-
 import struct
 import numpy as np
 import jax.numpy as jnp
 from PIL import Image
 import os
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
+from jax_gs.core.camera import Camera
 
 @dataclass
 class CameraInfo:
@@ -19,12 +20,6 @@ class CameraInfo:
     image_name: str
     width: int
     height: int
-
-@dataclass
-class PointCloud:
-    points: np.ndarray
-    colors: np.ndarray
-    normals: np.ndarray
 
 def read_cameras_binary(path_to_model_file):
     cameras = {}
@@ -59,7 +54,6 @@ def read_cameras_binary(path_to_model_file):
                 fx = f
                 fy = f
             else:
-                 # Minimal implementation, might need to expand if other models appear
                 raise NotImplementedError(f"Camera model {model_id} not implemented")
 
             cameras[camera_id] = {
@@ -76,7 +70,6 @@ def read_images_binary(path_to_model_file):
     with open(path_to_model_file, "rb") as fid:
         num_reg_images = struct.unpack("<Q", fid.read(8))[0]
         for _ in range(num_reg_images):
-            # i (4), 4d (32), 3d (24), i (4) = 64 bytes
             binary_image_properties = struct.unpack("<idddddddi", fid.read(64))
             image_id = binary_image_properties[0]
             qvec = np.array(binary_image_properties[1:5])
@@ -134,143 +127,88 @@ def qvec2rotmat(qvec):
          2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1],
          1 - 2 * qvec[1]**2 - 2 * qvec[2]**2]])
 
-def load_colmap_data(source_path, images_dir_name="images_4"):
+def load_colmap_data_raw(source_path, images_dir_name="images_4"):
     """
-    Load COLMAP data from a directory.
-    
-    Args:
-        source_path (str): Path to the COLMAP data directory.
-        images_dir_name (str): Name of the images directory (default: "images_4").
-    
-    Returns:
-        tuple: A tuple containing the following:
-            - xyz (numpy.ndarray): Array of 3D points.
-            - rgb (numpy.ndarray): Array of RGB colors.
-            - train_cam_infos (list): List of CameraInfo objects.   
+    Internal loader for COLMAP binary data.
     """
     cameras_extrinsic_file = os.path.join(source_path, "sparse/0", "images.bin")
     cameras_intrinsic_file = os.path.join(source_path, "sparse/0", "cameras.bin")
     points3D_file = os.path.join(source_path, "sparse/0", "points3D.bin")
     
-    print("Loading COLMAP data...")
     cam_extrinsics = read_images_binary(cameras_extrinsic_file)
     cam_intrinsics = read_cameras_binary(cameras_intrinsic_file)
     points3D_data = read_points3D_binary(points3D_file)
     
-    # Process Points 3D
     xyz = np.array([p["xyz"] for p in points3D_data.values()])
     rgb = np.array([p["rgb"] for p in points3D_data.values()]) / 255.0
     
-    print(f"Loaded {len(xyz)} 3D points")
-    
-    # Process Cameras
     train_cameras = []
-    
-    # We sort by image id to keep some order
     sorted_image_ids = sorted(cam_extrinsics.keys())
-
-    # Check for image files
     images_dir = os.path.join(source_path, images_dir_name)
-    if not os.path.exists(images_dir):
-        print(f"Error: Images directory {images_dir} not found")
-        return xyz, rgb, []
-
     image_files = sorted([f for f in os.listdir(images_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
     
-    # Analyze if we need mapping
-    sparse_names = [cam_extrinsics[k]["name"] for k in sorted_image_ids]
-    use_index_mapping = False
-    
-    # Check if first image exists
-    first_path = os.path.join(images_dir, sparse_names[0])
-    if not os.path.exists(first_path):
-        print(f"Exact filename {sparse_names[0]} not found in {images_dir}. Checking for index-based mapping...")
-        if len(sparse_names) == len(image_files):
-            print(f"Found {len(image_files)} images, same as model. using 1-to-1 mapping by sort order.")
-            use_index_mapping = True
-        else:
-            print(f"Warning: Model has {len(sparse_names)} images, disk has {len(image_files)}. Mapping might be wrong.")
-            # Still try to map if counts differ? Maybe just valid subset? 
-            # If disk has MORE, we might be fine if we assume sorted, but risky.
-            # If disk has LESS, definitely bad.
-            # Let's try 1-to-1 for shared count?
-            # For now, if sizes mismatch and names mismatch, we are in trouble.
-            # But we'll try to use index mapping if requested essentially.
-            if len(image_files) > 0:
-                print("Attempting to use sorted list from disk.")
-                use_index_mapping = True
+    first_name = cam_extrinsics[sorted_image_ids[0]]["name"]
+    use_index_mapping = not os.path.exists(os.path.join(images_dir, first_name))
     
     for i, image_id in enumerate(sorted_image_ids):
         extr = cam_extrinsics[image_id]
         intr = cam_intrinsics[extr["camera_id"]]
         
-        height = intr["height"]
-        width = intr["width"]
-        
         R = qvec2rotmat(extr["qvec"])
         T = extr["tvec"]
         
-        # Convert to 4x4 matrix
-        w2c = np.eye(4)
-        w2c[:3, :3] = R
-        w2c[:3, 3] = T
-        
-        
-        # FOV calculations
-        # Params are always (fx, fy, cx, cy) now
         focal_length_x = intr["params"][0]
         focal_length_y = intr["params"][1]
+        width, height = intr["width"], intr["height"]
 
-        fovx = 2 * np.arctan(width / (2 * focal_length_x))
-        fovy = 2 * np.arctan(height / (2 * focal_length_y))
-        
-        if use_index_mapping and i < len(image_files):
-            image_name = image_files[i]
-        else:
-            image_name = extr["name"]
-            
+        image_name = image_files[i] if use_index_mapping and i < len(image_files) else extr["name"]
         image_path = os.path.join(images_dir, image_name)
         
-        if not os.path.exists(image_path):
-            print(f"Warning: Image {image_path} not found")
-            continue
+        if not os.path.exists(image_path): continue
             
-        # Load image
         image_pil = Image.open(image_path)
         image = np.array(image_pil)
         
-        # Resize if needed (naive resize if resolution doesn't match intrinsics)
-        # But usually images_4 matches the sparse model if run correctly
-        # Here we just check and print warning
         if image.shape[1] != width or image.shape[0] != height:
-             # If mismatch, assume we need to update intrinsics to match the loaded image
-             scale_x = image.shape[1] / width
-             scale_y = image.shape[0] / height
-             
-             # Update intrinsics
+             scale_x, scale_y = image.shape[1] / width, image.shape[0] / height
              focal_length_x *= scale_x
              focal_length_y *= scale_y
-             fovx = 2 * np.arctan(image.shape[1] / (2 * focal_length_x))
-             fovy = 2 * np.arctan(image.shape[0] / (2 * focal_length_y))
-             
-             width = image.shape[1]
-             height = image.shape[0]
+             width, height = image.shape[1], image.shape[0]
         
-        image = image / 255.0
+        fovx = 2 * math.atan(width / (2 * focal_length_x))
+        fovy = 2 * math.atan(height / (2 * focal_length_y))
         
         train_cameras.append(CameraInfo(
-            uid=image_id,
-            R=R,
-            T=T,
-            FovY=fovy,
-            FovX=fovx,
-            image=image,
-            image_path=image_path,
-            image_name=image_name,
-            width=width,
-            height=height
+            uid=image_id, R=R, T=T, FovY=fovy, FovX=fovx,
+            image=image / 255.0, image_path=image_path, image_name=image_name,
+            width=width, height=height
         ))
         
-    print(f"Loaded {len(train_cameras)} cameras")
-    
     return xyz, rgb, train_cameras
+
+def load_colmap_dataset(path: str, images_subdir: str = "images_8"):
+    """
+    Load COLMAP data and convert to package-standard Camera entities.
+    """
+    xyz, rgb, train_cam_infos = load_colmap_data_raw(path, images_subdir)
+    
+    jax_cameras = []
+    jax_targets = []
+    
+    for info in train_cam_infos:
+        fx = info.width / (2 * math.tan(info.FovX / 2))
+        fy = info.height / (2 * math.tan(info.FovY / 2))
+        cx, cy = info.width / 2.0, info.height / 2.0
+        
+        w2c = np.eye(4)
+        w2c[:3, :3], w2c[:3, 3] = info.R, info.T
+        
+        camera = Camera(
+            W=info.width, H=info.height,
+            fx=float(fx), fy=float(fy), cx=float(cx), cy=float(cy),
+            W2C=jnp.array(w2c), full_proj=jnp.eye(4)
+        )
+        jax_cameras.append(camera)
+        jax_targets.append(jnp.array(info.image))
+        
+    return xyz, rgb, jax_cameras, jax_targets

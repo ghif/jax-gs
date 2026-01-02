@@ -1,111 +1,90 @@
 # JAX Gaussian Splatting
 
-A minimal, JAX-based implementation of 3D Gaussian Splatting. This repository includes scripts to train a model on the standard Fern dataset and visualize the results.
+A minimal, high-performance, JAX-based implementation of 3D Gaussian Splatting. Restructured with a clean, modular architecture in the `jax_gs` package.
+
+## Features
+
+- **Clean Architecture**: Core logic modularized into `jax_gs` (core, renderer, io, training).
+- **Optimized Tile Rasterizer**: JAX-native implementation with efficient bit-packed sorting for CPU, CUDA, and Apple Silicon (MPS).
+- **Fast GPU Execution**: Optimized for NVIDIA L4 GPUs with full `float32` throughput.
+- **Resume Training**: Continue training from any saved PLY checkpoint.
+- **Unit Tested**: Comprehensive test suite for mathematical correctness and IO.
 
 ## Environment Setup (using uv)
 
-This project recommendeds using `uv` for fast Python package management. We suggest creating separate environments for CPU and MPS (Metal Performance Shaders) execution to handle dependency differences.
+This project recommends using `uv` for fast Python package management.
 
-1.  **Install uv** (if not already installed):
+1.  **Install uv**:
     ```bash
     curl -LsSf https://astral.sh/uv/install.sh | sh
     ```
 
-2.  **Setup CPU Environment** (`.cpu_env`):
-    Use this for standard execution or if you don't have a Mac with Apple Silicon.
+2.  **Setup Environment** (`.cpu_env`):
     ```bash
-    # Create virtual environment (Python 3.11 recommended)
     uv venv .cpu_env --python 3.11
-
-    # Activate
     source .cpu_env/bin/activate
-
-    # Install dependencies
     uv pip install -r requirements_cpu.txt
     ```
 
-3.  **Setup MPS (Mac GPU) Environment** (`.mps_env`):
-    Use this for accelerated training on macOS (Apple Silicon).
-    ```bash
-    # Create virtual environment
-    uv venv .mps_env --python 3.11
-
-    # Activate
-    source .mps_env/bin/activate
-
-    # Install dependencies
-    uv pip install -r requirements_mps.txt
-    ```
-
-    *Note: MPS support requires explicit `float32` enforcing which is handled by the `train_fern_mps.py` script.*
-
-
 ## Data Preparation
 
-1.  Download the **Fern** dataset (from the NeRF LLFF data).
-2.  Place it in the `data` directory so that the structure looks like this:
-    ```text
-    data/
-    └── nerf_example_data/
-        └── nerf_llff_data/
-            └── fern/
-                ├── images_8/   # Downsampled images
-                └── sparse/     # COLMAP data
-                    └── 0/
-    ```
+1.  Download the **Fern** dataset (from NeRF LLFF data).
+2.  Place it in `data/nerf_example_data/nerf_llff_data/fern`.
+3.  The directory should contain `images_8/` and `sparse/0/`.
 
-## Training
+## Usage
 
-### CPU Training
-To start training on the CPU (using `.cpu_env`):
+### Training
+
+Start a new training session on the Fern dataset:
 ```bash
-source .cpu_env/bin/activate
-python train_fern.py
+python train_fern.py --num_iterations 10000
 ```
 
-### MPS (Mac GPU) Training
-To start training on Mac GPU (using `.mps_env`):
+### Resume Training
+
+Continue training from the latest `.ply` checkpoint:
 ```bash
-source .mps_env/bin/activate
-python train_fern_mps.py
+python train_fern_resume.py --num_iterations 5000
 ```
 
-This will:
-*   Load the COLMAP data and images.
-*   Initialize 3D Gaussians from the sparse point cloud.
-*   Train for 10,000 iterations.
-*   Save outputs to the `results/` directory.
+**Parameters:**
+- `--num_iterations`: Total iterations for `train_fern.py` or *additional* iterations for `train_fern_resume.py`. Default is 10000.
 
 **Outputs:**
-*   **Progress Images**: `results/fern_YYYYMMDD_HHMMSS/progress/` (rendered views during training).
-*   **PLY Checkpoints**: `results/fern_YYYYMMDD_HHMMSS/ply/` (saved splat files).
+- **Progress Images**: `results/fern_YYYYMMDD_HHMMSS/progress/`.
+- **PLY Checkpoints**: `results/fern_YYYYMMDD_HHMMSS/ply/`.
 
-## Visualization
+### Visualization
 
-You can visualize the trained Gaussian Splats using the included Viser-based viewer.
-
-Run the viewer with the path to a generated `.ply` file:
-
+Visualize trained splats using the Viser-based viewer:
 ```bash
-# Works in either environment
-python viewer_ply.py results/fern_YYYYMMDD_HHMMSS/ply/fern_final_splats.ply
+python viewer_ply.py results/fern_YYYYMMDD_HHMMSS/ply/fern_final.ply
 ```
 
-*(Replace `fern_YYYYMMDD_HHMMSS` with the actual timestamp folder generated during training)*
+## Quality Assurance
 
-**Controls:**
-*   **Left Click + Drag**: Rotate camera.
-*   **Right Click + Drag**: Pan camera.
-*   **Scroll**: Zoom.
-*   The viewer runs in the browser (usually at `http://localhost:8080`).
+### Run Unit Tests
+To verify mathematical correctness and IO stability, run the test suite using `pytest`.
+
+```bash
+# Recommended: Run on CPU for deterministic numerical checks
+JAX_PLATFORMS=cpu PYTHONPATH=. pytest tests/
+```
+
+If you encounter environment issues, you can explicitly point to your virtual environment's site-packages:
+```bash
+JAX_PLATFORMS=cpu PYTHONPATH=.:$(pwd)/.cpu_env/lib/python3.11/site-packages pytest tests/
+```
 
 ## Project Structure
 
-*   `train_fern.py`: Main training script (CPU).
-*   `train_fern_mps.py`: Training script optimized for MPS (Mac GPU).
-*   `renderer_v2.py`: Tile-based differentiable renderer (JAX).
-*   `renderer_v2_mps.py`: MPS-optimized renderer with float32 enforcement and stable sorting.
-*   `viewer_ply.py`: Script to load and visualize `.ply` files.
-*   `gaussians.py`: Data structure and initialization for 3D Gaussians.
-*   `requirements_cpu.txt`: Dependencies for CPU environment.
-*   `requirements_mps.txt`: Dependencies for MPS environment.
+- `jax_gs/`: Core package containing:
+    - `core/`: `Gaussians` and `Camera` data structures.
+    - `renderer/`: Tiled rasterization and projection kernels.
+    - `io/`: COLMAP and PLY loading/saving logic.
+    - `training/`: Loss functions and JIT-compiled trainer step.
+- `tests/`: Unit tests for each module.
+- `train_fern.py`: Entry point for training.
+- `train_fern_resume.py`: Entry point for resuming training.
+- `viewer_ply.py`: PLY visualization script.
