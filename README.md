@@ -10,6 +10,10 @@ A minimal, high-performance, JAX-based implementation of 3D Gaussian Splatting. 
 - **Resume Training**: Continue training from any saved PLY checkpoint.
 - **Unit Tested**: Comprehensive test suite for mathematical correctness and IO.
 
+## Training Demo
+
+<video src="results/progress_video.mp4" controls width="100%"></video>
+
 ## Environment Setup (using uv)
 
 This project recommends using `uv` for fast Python package management.
