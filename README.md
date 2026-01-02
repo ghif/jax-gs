@@ -12,7 +12,7 @@ A minimal, high-performance, JAX-based implementation of 3D Gaussian Splatting. 
 
 ## Training Demo
 
-<video src="results/progress_video.mp4" controls width="100%"></video>
+![Training Results](results/progress_video.mp4)
 
 ## Environment Setup (using uv)
 
