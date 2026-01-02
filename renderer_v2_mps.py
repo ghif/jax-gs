@@ -1,3 +1,8 @@
+"""
+TODO:
+Fix this code to run faster!
+"""
+
 import jax
 import jax.numpy as jnp
 from typing import NamedTuple, Tuple
