@@ -9,3 +9,4 @@ scipy
 pillow
 tqdm
 matplotlib
+pytest
