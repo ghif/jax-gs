@@ -91,3 +91,52 @@ def test_bitpacked_sort_robustness():
     sentinel = num_tiles_x * num_tiles_y
     
     assert sorted_tiles[-1] == sentinel
+
+def test_full_render():
+    from jax_gs.renderer.renderer import render
+    
+    # 1. Setup a single centered Gaussian
+    means3D = jnp.array([[0.0, 0.0, 5.0]]) # 5 units ahead
+    colors = jnp.array([[1.0, 0.0, 0.0]]) # Red
+    gaussians = init_gaussians_from_pcd(means3D, colors)
+    
+    # Set high opacity and small scale for a sharp point
+    gaussians = gaussians.replace(
+        opacities=jnp.array([[10.0]]), # Near 1.0 after sigmoid
+        scales=jnp.array([[-1.0, -1.0, -1.0]]) # log(0.36) approx
+    )
+    
+    # 2. Setup Camera
+    W, H = 64, 64
+    cam = Camera(
+        W=W, H=H,
+        fx=100.0, fy=100.0,
+        cx=32.0, cy=32.0,
+        W2C=jnp.eye(4),
+        full_proj=jnp.eye(4)
+    )
+    
+    # 3. Render
+    image = render(gaussians, cam)
+    
+    # NEW: Save image for visual inspection
+    from PIL import Image
+    import numpy as np
+    img_np = (np.array(image) * 255).astype(np.uint8)
+    Image.fromarray(img_np).save("test_render.png")
+    
+    assert image.shape == (H, W, 3)
+    
+    # The center pixel should be mostly red
+    center_pixel = image[32, 32]
+    assert center_pixel[0] > 0.5 # Red component
+    assert center_pixel[1] < 0.1 # Green component
+    assert center_pixel[2] < 0.1 # Blue component
+    
+    # Pixels far away should be background (black)
+    corner_pixel = image[0, 0]
+    np.testing.assert_allclose(corner_pixel, jnp.zeros(3), atol=1e-2)
+    
+    # Overall image should have some content
+    assert image.max() > 0.5
+    assert image.min() == 0.0

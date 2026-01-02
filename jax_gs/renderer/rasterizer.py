@@ -83,6 +83,17 @@ def get_tile_interactions(means2D, radii, valid_mask, depths, H, W, tile_size: i
     sorted_tile_ids = sort_tile_ids[sort_indices]
     sorted_gaussian_ids = flat_gaussian_ids[sort_indices]
     
+    # Ensure at least BLOCK_SIZE for dynamic_slice in rasterizer
+    # Use python max() to keep it a concrete integer for jnp.full/at
+    total_interactions = sorted_tile_ids.shape[0]
+    padded_size = max(total_interactions, BLOCK_SIZE)
+    
+    pad_tile_ids = jnp.full((padded_size,), num_tiles_total, dtype=jnp.int32)
+    pad_gaussian_ids = jnp.zeros((padded_size,), dtype=jnp.int32)
+    
+    sorted_tile_ids = pad_tile_ids.at[:total_interactions].set(sorted_tile_ids)
+    sorted_gaussian_ids = pad_gaussian_ids.at[:total_interactions].set(sorted_gaussian_ids)
+    
     return sorted_tile_ids, sorted_gaussian_ids, valid_interactions.sum()
 
 def render_tiles(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaussian_ids, 
