@@ -6,6 +6,16 @@ from jax_gs.core.camera import Camera
 def project_gaussians(gaussians: Gaussians, camera: Camera):
     """
     Project 3D Gaussians to 2D splats.
+
+    Args:
+        gaussians: Gaussians dataclass
+        camera: Camera dataclass 
+    Returns:
+        means2D: 2D means of the projected splats
+        cov2D: 2D covariance of the projected splats
+        radii: Radii of the projected splats
+        valid_mask: Valid mask for the projected splats
+        z: Depth of the projected splats
     """
     means3D = gaussians.means
     scales = gaussians.scales

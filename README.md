@@ -61,9 +61,18 @@ python train_fern_resume.py --num_iterations 5000
 
 ### Visualization
 
-Visualize trained splats using the Viser-based viewer:
+Visualize the results using the Viser-based viewers:
+
+#### 1. PLY Viewer
+Visualize trained splats from a saved `.ply` checkpoint:
 ```bash
 python viewer_ply.py results/fern_YYYYMMDD_HHMMSS/ply/fern_final.ply
+```
+
+#### 2. Random Gaussians Viewer
+Visualize randomly generated 3D Gaussians to understand the representation:
+```bash
+python viewer_random.py --num 5000
 ```
 
 ## Quality Assurance
@@ -91,4 +100,5 @@ JAX_PLATFORMS=cpu PYTHONPATH=.:$(pwd)/.cpu_env/lib/python3.11/site-packages pyte
 - `tests/`: Unit tests for each module.
 - `train_fern.py`: Entry point for training.
 - `train_fern_resume.py`: Entry point for resuming training.
-- `viewer_ply.py`: PLY visualization script.
+- `viewer_ply.py`: Viser-based PLY visualization script.
+- `viewer_random.py`: Viser-based random Gaussian visualization script.

@@ -1,4 +1,9 @@
+"""
+This script provides a simple 3D point cloud viewer for PLY files using the Viser library.
+It loads point cloud data (coordinates and optionally colors) from a specified .ply file
+and renders it in a web-based interactive viewer.
 
+"""
 import viser
 import time
 import argparse

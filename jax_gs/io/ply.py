@@ -5,6 +5,10 @@ from jax_gs.core.gaussians import Gaussians
 def save_ply(path, gaussians: Gaussians):
     """
     Save Gaussians to a PLY file compatible with 3DGS viewers (like Viser).
+
+    Args:
+        path: Path to save the PLY file
+        gaussians: Gaussians dataclass
     """
     print(f"Saving PLY to {path}...")
     
@@ -63,6 +67,11 @@ def save_ply(path, gaussians: Gaussians):
 def load_ply(path):
     """
     Load Gaussians from a PLY file.
+
+    Args:
+        path: Path to the PLY file
+    Returns:
+        gaussians: Gaussians dataclass
     """
     print(f"Loading PLY from {path}...")
     

@@ -7,6 +7,13 @@ from jax_gs.renderer.rasterizer import get_tile_interactions, render_tiles, TILE
 def render(gaussians: Gaussians, camera: Camera, background=jnp.array([0.0, 0.0, 0.0])):
     """
     Main entry point for rendering.
+
+    Args:
+        gaussians: Gaussians dataclass
+        camera: Camera dataclass
+        background: Background color
+    Returns:
+        image: Rendered image
     """
     # 1. Project Gaussians to 2D
     means2D, cov2D, radii, valid_mask, depths = project_gaussians(gaussians, camera)

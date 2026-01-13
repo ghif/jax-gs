@@ -13,8 +13,12 @@ class Gaussians:
 def init_gaussians_from_pcd(points: jnp.ndarray, colors: jnp.ndarray):
     """
     Initialize Gaussians from a point cloud.
-    points: (N, 3)
-    colors: (N, 3) in [0, 1]
+
+    Args:
+        points: (N, 3)
+        colors: (N, 3) in [0, 1]
+    Returns:
+        gaussians: Gaussians dataclass
     """
     num_points = points.shape[0]
     
@@ -49,6 +53,12 @@ def get_covariance_3d(scales: jnp.ndarray, quaternions: jnp.ndarray):
     """
     Computes 3D covariance matrix from scales and quaternions.
     Σ = R S S^T R^T
+
+    Args:
+        scales: (N, 3)
+        quaternions: (N, 4)
+    Returns:
+        covariance: (N, 3, 3)
     """
     # Normalize quaternions
     q = quaternions / jnp.linalg.norm(quaternions, axis=-1, keepdims=True)

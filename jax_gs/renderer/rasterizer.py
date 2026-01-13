@@ -10,6 +10,19 @@ def get_tile_interactions(means2D, radii, valid_mask, depths, H, W, tile_size: i
     """
     Generate tile interactions.
     Uses bit-packed int32 sort for broad backend compatibility.
+
+    Args:
+        means2D: 2D means of the projected splats
+        radii: Radii of the projected splats
+        valid_mask: Valid mask for the projected splats
+        depths: Depth of the projected splats
+        H: Image height
+        W: Image width
+        tile_size: Tile size
+    Returns:
+        sorted_tile_ids: Sorted tile IDs
+        sorted_gaussian_ids: Sorted Gaussian IDs
+        valid_interactions: Number of valid interactions
     """
     num_points = means2D.shape[0]
     num_tiles_x = (W + tile_size - 1) // tile_size
@@ -32,6 +45,19 @@ def get_tile_interactions(means2D, radii, valid_mask, depths, H, W, tile_size: i
     valid_mask = valid_mask & on_screen & (tile_max_x >= tile_min_x) & (tile_max_y >= tile_min_y)
     
     def get_gaussian_tiles(idx, t_min_x, t_max_x, t_min_y, t_max_y, is_valid):
+        """
+        Get the tiles that a Gaussian intersects with.
+
+        Args:
+            idx: Gaussian index
+            t_min_x: Minimum tile x coordinate
+            t_max_x: Maximum tile x coordinate
+            t_min_y: Minimum tile y coordinate
+            t_max_y: Maximum tile y coordinate
+            is_valid: Valid mask for the Gaussian
+        Returns:
+            tile_ids: Tile IDs that the Gaussian intersects with
+        """
         xs = jnp.arange(0, 8) 
         ys = jnp.arange(0, 8)
         grid_y, grid_x = jnp.meshgrid(ys, xs, indexing='ij') 
@@ -98,6 +124,23 @@ def get_tile_interactions(means2D, radii, valid_mask, depths, H, W, tile_size: i
 
 def render_tiles(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaussian_ids, 
                  H, W, tile_size: int = TILE_SIZE, background=jnp.array([0.0, 0.0, 0.0])):
+    """
+    Render the tiles.
+
+    Args:
+        means2D: 2D means of the projected splats
+        cov2D: 2D covariance of the projected splats
+        opacities: Opacities of the projected splats
+        colors: Colors of the projected splats
+        sorted_tile_ids: Sorted tile IDs
+        sorted_gaussian_ids: Sorted Gaussian IDs
+        H: Image height
+        W: Image width
+        tile_size: Tile size
+        background: Background color
+    Returns:
+        image: Rendered image
+    """
     
     num_tiles_x = (W + tile_size - 1) // tile_size
     num_tiles_y = (H + tile_size - 1) // tile_size
@@ -111,6 +154,14 @@ def render_tiles(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaus
     ], axis=-2)
     
     def rasterize_single_tile(tile_idx):
+        """
+        Rasterize a single tile.
+
+        Args:
+            tile_idx: Tile index
+        Returns:
+            image: Rendered image
+        """
         start_idx = jnp.searchsorted(sorted_tile_ids, tile_idx)
         end_idx = jnp.searchsorted(sorted_tile_ids, tile_idx + 1)
         count = end_idx - start_idx
@@ -172,6 +223,7 @@ def render_tiles(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaus
         tile_colors = jax.lax.cond(count > 0, process_tile, empty_tile)
         return tile_colors.reshape(tile_size, tile_size, 3)
 
+    # Rasterize all tiles in parallel
     all_tiles = jax.vmap(rasterize_single_tile)(jnp.arange(num_tiles))
     
     output_grid = all_tiles.reshape(num_tiles_y, num_tiles_x, tile_size, tile_size, 3)
