@@ -1,0 +1,15 @@
+# TPU VM installation instructions
+# Run this command on your TPU VM:
+# pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+jax
+jaxlib
+viser
+numpy
+scipy
+pillow
+tqdm
+optax
+chex
+matplotlib
+pytest
