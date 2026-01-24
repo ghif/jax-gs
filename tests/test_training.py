@@ -18,6 +18,25 @@ def test_losses():
     np_mse = mse_loss(pred, target)
     assert jnp.allclose(np_mse, 0.00666667)
 
+def test_ssim_losses():
+    # Setup mock images (H, W, C)
+    H, W = 32, 32
+    target = jax.random.uniform(jax.random.PRNGKey(0), (H, W, 3))
+    pred = target + 0.1 * jax.random.uniform(jax.random.PRNGKey(1), (H, W, 3))
+    
+    from jax_gs.training.losses import ssim, d_ssim_loss
+    
+    val_ssim = ssim(pred, target)
+    val_d_ssim = d_ssim_loss(pred, target)
+    
+    assert 0 <= val_ssim <= 1.0
+    assert 0 <= val_d_ssim <= 1.0
+    assert jnp.allclose(val_d_ssim, (1.0 - val_ssim) / 2.0)
+    
+    # Perfect match
+    assert jnp.allclose(ssim(target, target), 1.0)
+    assert jnp.allclose(d_ssim_loss(target, target), 0.0)
+
 def test_train_step_execution():
     # Setup minimal training state
     num_points = 10

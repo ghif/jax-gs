@@ -121,7 +121,7 @@ def load_ply(path):
     
     return means, covs, colors, opacities
 
-def run_ply_viewer(ply_path):
+def run_ply_viewer(ply_path, port=8080):
     print(f"Parsing PLY from {ply_path}...")
     means, covs, colors, opacities = load_ply(ply_path)
     
@@ -130,7 +130,7 @@ def run_ply_viewer(ply_path):
 
     print(f"Loaded {len(means)} splats")
     
-    server = viser.ViserServer()
+    server = viser.ViserServer(port=port)
 
     # Set dark mode
     server.configure_theme(dark_mode=True)
@@ -162,9 +162,10 @@ def run_ply_viewer(ply_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("ply_path", type=str, help="Path to the .ply file")
+    parser.add_argument("--port", type=int, default=8080, help="Port to run the viewer on")
     args = parser.parse_args()
     
     if not os.path.exists(args.ply_path):
         print(f"Error: File {args.ply_path} not found.")
     else:
-        run_ply_viewer(args.ply_path)
+        run_ply_viewer(args.ply_path, port=args.port)
