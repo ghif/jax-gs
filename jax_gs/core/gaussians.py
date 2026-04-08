@@ -75,12 +75,11 @@ def get_covariance_3d(scales: jnp.ndarray, quaternions: jnp.ndarray):
         jnp.stack([2*x*z - 2*r*y, 2*y*z + 2*r*x, 1 - 2*x**2 - 2*y**2], axis=-1)
     ], axis=-2)
     
-    # Scaling matrix
+    # Scaling matrix (avoid vmap)
     s = jnp.exp(scales)
-    S = jax.vmap(lambda x: jnp.diag(x))(s)
     
-    # M = R S
-    M = R @ S
+    # M = R S. Since S is diagonal, this is just scaling columns of R
+    M = R * s[:, None, :]
     
     # Σ = M M^T
     Sigma = M @ M.transpose(0, 2, 1)

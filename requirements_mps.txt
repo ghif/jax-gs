@@ -1,7 +1,7 @@
-jax-metal
-jax==0.5.0
-jaxlib==0.5.0
-chex==0.1.88
+# jax-metal removed in favor of mlx for Apple Silicon acceleration
+jax==0.9.0
+jaxlib==0.9.0
+chex==0.1.91
 optax==0.2.3
 viser
 numpy
@@ -10,3 +10,5 @@ pillow
 tqdm
 matplotlib
 pytest
+mlx
+torch

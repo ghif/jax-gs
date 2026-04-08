@@ -4,7 +4,7 @@ from typing import Tuple
 
 # Standard Constants
 TILE_SIZE = 16
-BLOCK_SIZE = 256  
+BLOCK_SIZE = 192  
 
 def get_tile_interactions(means2D, radii, valid_mask, depths, H, W, tile_size: int = TILE_SIZE):
     """
@@ -44,40 +44,21 @@ def get_tile_interactions(means2D, radii, valid_mask, depths, H, W, tile_size: i
     
     valid_mask = valid_mask & on_screen & (tile_max_x >= tile_min_x) & (tile_max_y >= tile_min_y)
     
-    def get_gaussian_tiles(idx, t_min_x, t_max_x, t_min_y, t_max_y, is_valid):
-        """
-        Get the tiles that a Gaussian intersects with.
+    # Pre-calculate relative tile offsets for broadcasting
+    # Use an 8x8 grid to match MLX parity exactly
+    OFFSET_SIZE = 8
+    off_y, off_x = jnp.meshgrid(jnp.arange(OFFSET_SIZE), jnp.arange(OFFSET_SIZE), indexing='ij')
+    off_x = off_x.flatten()
+    off_y = off_y.flatten()
 
-        Args:
-            idx: Gaussian index
-            t_min_x: Minimum tile x coordinate
-            t_max_x: Maximum tile x coordinate
-            t_min_y: Minimum tile y coordinate
-            t_max_y: Maximum tile y coordinate
-            is_valid: Valid mask for the Gaussian
-        Returns:
-            tile_ids: Tile IDs that the Gaussian intersects with
-        """
-        xs = jnp.arange(0, 8) 
-        ys = jnp.arange(0, 8)
-        grid_y, grid_x = jnp.meshgrid(ys, xs, indexing='ij') 
-        
-        abs_x = t_min_x + grid_x
-        abs_y = t_min_y + grid_y
-        
-        in_range = (abs_x <= t_max_x) & (abs_y <= t_max_y) & is_valid
-        
-        tile_ids = abs_y * num_tiles_x + abs_x
-        tile_ids = jnp.where(in_range, tile_ids, -1)
-        
-        return tile_ids.flatten()
-
-    all_tile_ids = jax.vmap(get_gaussian_tiles)(
-        jnp.arange(num_points), 
-        tile_min_x, tile_max_x, 
-        tile_min_y, tile_max_y, 
-        valid_mask
-    )
+    # Use broadcasting instead of vmap for Gaussian-tile assignment
+    abs_x = tile_min_x[:, None] + off_x[None, :]
+    abs_y = tile_min_y[:, None] + off_y[None, :]
+    
+    in_range = (abs_x <= tile_max_x[:, None]) & (abs_y <= tile_max_y[:, None]) & valid_mask[:, None]
+    
+    all_tile_ids = abs_y * num_tiles_x + abs_x
+    all_tile_ids = jnp.where(in_range, all_tile_ids, -1)
     
     all_gaussian_ids = jnp.broadcast_to(jnp.arange(num_points)[:, None], all_tile_ids.shape)
     all_depths = jnp.broadcast_to(depths[:, None], all_tile_ids.shape)
@@ -104,10 +85,12 @@ def get_tile_interactions(means2D, radii, valid_mask, depths, H, W, tile_size: i
     
     # 3. Pack (all in int32)
     key = (sort_tile_ids << DEPTH_BITS) | depth_quant
-    sort_indices = jnp.argsort(key)
     
-    sorted_tile_ids = sort_tile_ids[sort_indices]
-    sorted_gaussian_ids = flat_gaussian_ids[sort_indices]
+    # Use lax.sort_key_val for faster sorting on CPU/GPU
+    sorted_keys, sorted_gaussian_ids = jax.lax.sort_key_val(key, flat_gaussian_ids)
+    
+    # Extract back the original Tile IDs from the sorted keys
+    sorted_tile_ids = sorted_keys >> DEPTH_BITS
     
     # Ensure at least BLOCK_SIZE for dynamic_slice in rasterizer
     # Use python max() to keep it a concrete integer for jnp.full/at
@@ -148,66 +131,74 @@ def render_tiles(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaus
     
     det = cov2D[:, 0, 0] * cov2D[:, 1, 1] - cov2D[:, 0, 1]**2
     det = jnp.maximum(det, 1e-6)
+    
     inv_cov2D = jnp.stack([
         jnp.stack([cov2D[:, 1, 1] / det, -cov2D[:, 0, 1] / det], axis=-1),
         jnp.stack([-cov2D[:, 1, 0] / det, cov2D[:, 0, 0] / det], axis=-1)
     ], axis=-2)
+    # Pre-calculate sigmoid opacities
+    sig_opacities = jax.nn.sigmoid(opacities)
+    
+    # Pre-calculate tile boundaries
+    tile_indices = jnp.arange(num_tiles + 1)
+    tile_boundaries = jnp.searchsorted(sorted_tile_ids, tile_indices)
+
+    # Pre-calculate pixel grid for a single tile
+    py, px = jnp.mgrid[0:tile_size, 0:tile_size]
+    tile_pixel_x = px.astype(jnp.float32)
+    tile_pixel_y = py.astype(jnp.float32)
     
     def rasterize_single_tile(tile_idx):
-        """
-        Rasterize a single tile.
-
-        Args:
-            tile_idx: Tile index
-        Returns:
-            image: Rendered image
-        """
-        start_idx = jnp.searchsorted(sorted_tile_ids, tile_idx)
-        end_idx = jnp.searchsorted(sorted_tile_ids, tile_idx + 1)
+        start_idx = tile_boundaries[tile_idx]
+        end_idx = tile_boundaries[tile_idx + 1]
         count = end_idx - start_idx
         
-        indices = jax.lax.dynamic_slice(sorted_gaussian_ids, (start_idx,), (BLOCK_SIZE,))
-        local_mask = jnp.arange(BLOCK_SIZE) < count
-        safe_indices = jnp.where(local_mask, indices, 0)
+        # Matched indexing: Use clipped take for robust gathering
+        gather_indices = jnp.clip(start_idx + jnp.arange(BLOCK_SIZE), 0, sorted_gaussian_ids.shape[0] - 1)
+        indices = jnp.take(sorted_gaussian_ids, gather_indices)
+        local_mask = (start_idx + jnp.arange(BLOCK_SIZE)) < (start_idx + count)
+        safe_indices = indices
         
         t_means = means2D[safe_indices]
         t_inv_cov = inv_cov2D[safe_indices]
-        t_ops = opacities[safe_indices]
+        t_ops = sig_opacities[safe_indices]
         t_cols = colors[safe_indices]
         
         ty = tile_idx // num_tiles_x
         tx = tile_idx % num_tiles_x
-        pix_min_x = tx * tile_size
-        pix_min_y = ty * tile_size
+        pix_min_x = (tx * tile_size).astype(jnp.float32)
+        pix_min_y = (ty * tile_size).astype(jnp.float32)
         
-        py, px = jnp.mgrid[0:tile_size, 0:tile_size]
-        pixel_x = pix_min_x + px
-        pixel_y = pix_min_y + py
-        pixel_coords = jnp.stack([pixel_x, pixel_y], axis=-1).reshape(-1, 2)
+        # Grid construction with synced centers
+        grid_x = pix_min_x + tile_pixel_x
+        grid_y = pix_min_y + tile_pixel_y
+        pixel_coords = jnp.stack([grid_x, grid_y], axis=-1).reshape(-1, 2)
         pixel_valid = (pixel_coords[:, 0] < W) & (pixel_coords[:, 1] < H)
+
+        # Pre-extract covariance components for expanded math
+        t_ic00 = t_inv_cov[:, 0, 0]
+        t_ic01_2 = 2.0 * t_inv_cov[:, 0, 1]
+        t_ic11 = t_inv_cov[:, 1, 1]
+        t_op_vec = t_ops[:, 0]
         
         def process_tile():
             def blend_pixel(p_coord, p_valid):
                 def scan_fn(carry, i):
                     accum_color, T = carry
-                    is_valid = local_mask[i] & (T > 1e-4)
+                    is_active = local_mask[i] & (T > 1e-4)
                     
                     mu = t_means[i]
-                    icov = t_inv_cov[i]
-                    op = t_ops[i, 0]
-                    col = t_cols[i]
+                    dx = p_coord[0] - mu[0]
+                    dy = p_coord[1] - mu[1]
                     
-                    d = p_coord - mu
-                    power = -0.5 * (d[0] * (d[0] * icov[0, 0] + d[1] * icov[1, 0]) + 
-                                   d[1] * (d[0] * icov[0, 1] + d[1] * icov[1, 1]))
+                    # Expanded quadratic form
+                    power = -0.5 * (dx * dx * t_ic00[i] + dx * dy * t_ic01_2[i] + dy * dy * t_ic11[i])
                     
-                    alpha = jnp.minimum(0.99, jnp.exp(power) * jax.nn.sigmoid(op))
-                    visible = (power > -10.0) & is_valid
-                    alpha = jnp.where(visible, alpha, 0.0)
+                    alpha = jnp.exp(power) * t_op_vec[i]
+                    alpha = jnp.where((power > -10.0) & is_active, jnp.minimum(0.99, alpha), 0.0)
                     
-                    weight = alpha * T
-                    new_color = accum_color + weight * col
                     new_T = T * (1.0 - alpha)
+                    new_color = accum_color + (alpha * T) * t_cols[i]
                     
                     return (new_color, new_T), None
                 
@@ -215,13 +206,14 @@ def render_tiles(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaus
                 final_color = final_color + final_T * background
                 return jnp.where(p_valid, final_color, 0.0)
 
-            return jax.vmap(blend_pixel)(pixel_coords, pixel_valid)
+            tile_image = jax.vmap(blend_pixel)(pixel_coords, pixel_valid)
+            return tile_image.reshape(tile_size, tile_size, 3)
             
         def empty_tile():
-            return jnp.tile(background, (tile_size * tile_size, 1))
+            return jnp.broadcast_to(background, (tile_size, tile_size, 3))
 
-        tile_colors = jax.lax.cond(count > 0, process_tile, empty_tile)
-        return tile_colors.reshape(tile_size, tile_size, 3)
+        tile_image = jax.lax.cond(count > 0, process_tile, empty_tile)
+        return tile_image
 
     # Rasterize all tiles in parallel
     all_tiles = jax.vmap(rasterize_single_tile)(jnp.arange(num_tiles))

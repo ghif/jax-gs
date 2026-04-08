@@ -35,21 +35,27 @@ def project_gaussians(gaussians: Gaussians, camera: Camera):
     
     # 4. Project to 2D
     # Jacobian of the perspective transformation
-    J = jnp.zeros((means3D.shape[0], 2, 3))
-    J = J.at[:, 0, 0].set(camera.fx / z)
-    J = J.at[:, 0, 2].set(-camera.fx * x / (z**2))
-    J = J.at[:, 1, 1].set(camera.fy / z)
-    J = J.at[:, 1, 2].set(-camera.fy * y / (z**2))
+    # J = [fx/z, 0, -fx*x/z^2]
+    #     [0, fy/z, -fy*y/z^2]
+    inv_z = 1.0 / z
+    inv_z2 = inv_z**2
+    
+    J = jnp.stack([
+        jnp.stack([camera.fx * inv_z, jnp.zeros_like(z), -camera.fx * x * inv_z2], axis=-1),
+        jnp.stack([jnp.zeros_like(z), camera.fy * inv_z, -camera.fy * y * inv_z2], axis=-1)
+    ], axis=-2)
     
     W_rot = camera.W2C[:3, :3]
     
-    def project_single_cov(c3d, j_mat):
-        return j_mat @ W_rot @ c3d @ W_rot.T @ j_mat.T
-    
-    cov2D = jax.vmap(project_single_cov)(cov3D, J)
+    # cov2D = J @ W_rot @ cov3D @ W_rot.T @ J.T
+    # Pre-multiply J @ W_rot
+    M = J @ W_rot
+    cov2D = M @ cov3D @ M.transpose(0, 2, 1)
+
     # Add a small bias for numerical stability (low pass filter)
-    cov2D = cov2D.at[:, 0, 0].add(0.3)
-    cov2D = cov2D.at[:, 1, 1].add(0.3)
+    # Use broadcasting for consistent speed
+    eye2D = jnp.eye(2)[None, :, :]
+    cov2D = cov2D + 0.3 * eye2D
     
     # 5. Means 2D
     means2D = jnp.stack([

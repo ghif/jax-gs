@@ -16,41 +16,38 @@ def mse_loss(pred, target):
 def ssim(img1, img2, window_size=11, size_average=True):
     """
     Structural Similarity Index Measure.
-    Simplified version for Gaussian Splatting (fixed window, uniform kernel).
+    Separable version for Gaussian Splatting (fixed window, uniform kernel).
     """
     channel = img1.shape[-1]
-    window = jnp.ones((window_size, window_size, 1, channel)) / (window_size * window_size)
     
-    mu1 = jax.lax.conv_general_dilated(
-        img1[None], window, (1, 1), 'SAME', 
-        dimension_numbers=('NHWC', 'HWIO', 'NHWC'),
-        feature_group_count=channel
-    )[0]
-    mu2 = jax.lax.conv_general_dilated(
-        img2[None], window, (1, 1), 'SAME',
-        dimension_numbers=('NHWC', 'HWIO', 'NHWC'),
-        feature_group_count=channel
-    )[0]
+    # Separable Gaussian Window (1D)
+    window_1d = jnp.ones((window_size, 1, 1, channel)) / window_size
+    
+    def blur(img):
+        # Vertical pass
+        h = jax.lax.conv_general_dilated(
+            img[None], window_1d, (1, 1), 'SAME',
+            dimension_numbers=('NHWC', 'HWIO', 'NHWC'),
+            feature_group_count=channel
+        )
+        # Horizontal pass (using transposed kernel)
+        window_1d_h = window_1d.transpose(1, 0, 2, 3)
+        return jax.lax.conv_general_dilated(
+            h, window_1d_h, (1, 1), 'SAME',
+            dimension_numbers=('NHWC', 'HWIO', 'NHWC'),
+            feature_group_count=channel
+        )[0]
+    
+    mu1 = blur(img1)
+    mu2 = blur(img2)
 
     mu1_sq = mu1 ** 2
     mu2_sq = mu2 ** 2
     mu1_mu2 = mu1 * mu2
 
-    sigma1_sq = jnp.maximum(0, jax.lax.conv_general_dilated(
-        (img1 * img1)[None], window, (1, 1), 'SAME',
-        dimension_numbers=('NHWC', 'HWIO', 'NHWC'),
-        feature_group_count=channel
-    )[0] - mu1_sq)
-    sigma2_sq = jnp.maximum(0, jax.lax.conv_general_dilated(
-        (img2 * img2)[None], window, (1, 1), 'SAME',
-        dimension_numbers=('NHWC', 'HWIO', 'NHWC'),
-        feature_group_count=channel
-    )[0] - mu2_sq)
-    sigma12 = jax.lax.conv_general_dilated(
-        (img1 * img2)[None], window, (1, 1), 'SAME',
-        dimension_numbers=('NHWC', 'HWIO', 'NHWC'),
-        feature_group_count=channel
-    )[0] - mu1_mu2
+    sigma1_sq = jnp.maximum(0, blur(img1 * img1) - mu1_sq)
+    sigma2_sq = jnp.maximum(0, blur(img2 * img2) - mu2_sq)
+    sigma12 = blur(img1 * img2) - mu1_mu2
 
     C1 = 0.01 ** 2
     C2 = 0.03 ** 2
