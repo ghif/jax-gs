@@ -13,8 +13,10 @@ def test_benchmark_training_fern():
     Benchmark a single training iteration using the Fern dataset.
     This includes rendering, loss calculation, and backpropagation.
     """
-    path = "data/nerf_example_data/nerf_llff_data/fern"
-    if not os.path.exists(path):
+    import fsspec
+    path = "gs://dataset-nerf/nerf_llff_data/fern"
+    fs, _ = fsspec.core.url_to_fs(path)
+    if not fs.exists(path):
         pytest.skip("Fern dataset not found at expected path.")
         
     # 1. Load Data

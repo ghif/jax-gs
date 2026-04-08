@@ -13,3 +13,5 @@ optax
 chex
 matplotlib
 pytest
+fsspec
+gcsfs

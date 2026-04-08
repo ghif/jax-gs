@@ -8,4 +8,5 @@ tqdm
 optax
 chex
 matplotlib
-pytest
+pytestfsspec
+gcsfs

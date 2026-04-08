@@ -7,7 +7,7 @@ from jax_gs.renderer.renderer import render
 from jax_gs.core.camera import Camera
 from functools import partial
 
-def benchmark_tpu():
+def test_benchmark_tpu():
     devices = jax.devices()
     num_devices = len(devices)
     print(f"Benchmarking on {num_devices} devices: {devices}")
@@ -56,6 +56,3 @@ def benchmark_tpu():
     print(f"Total time for {num_iters} iterations on {num_devices} cores: {total_time:.4f}s")
     print(f"Throughput (Total FPS): {fps:.2f} frames/s")
     print(f"Per-core latency: {total_time/num_iters:.4f}s")
-
-if __name__ == "__main__":
-    benchmark_tpu()
