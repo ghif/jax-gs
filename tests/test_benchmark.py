@@ -10,9 +10,9 @@ def test_benchmark_renderer():
     """
     Benchmark the JAX renderer performance.
     """
-    # 1. Setup Data (Realistic Scale)
-    num_points = 50_000
-    W, H = 512, 512
+    # 1. Setup Data (Scale of Fern Dataset @ 1/8 res)
+    num_points = 150_000
+    W, H = 504, 378
     
     print(f"\nBenchmarking with {num_points} Gaussians at {W}x{H} resolution...")
     
@@ -22,7 +22,7 @@ def test_benchmark_renderer():
     
     cam = Camera(
         W=W, H=H,
-        fx=500.0, fy=500.0,
+        fx=400.0, fy=400.0,
         cx=W/2, cy=H/2,
         W2C=jnp.eye(4),
         full_proj=jnp.eye(4)
@@ -37,7 +37,7 @@ def test_benchmark_renderer():
         # and dynamic W2C, full_proj from arguments
         curr_cam = Camera(
             W=W, H=H,
-            fx=500.0, fy=500.0,
+            fx=400.0, fy=400.0,
             cx=W/2, cy=H/2,
             W2C=W2C,
             full_proj=full_proj
