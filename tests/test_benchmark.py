@@ -28,10 +28,26 @@ def test_benchmark_renderer():
         full_proj=jnp.eye(4)
     )
     
+    # JIT Compile the render function using a helper to handle static camera parameters
+    print("Compiling render function (JIT)...")
+    
+    @jax.jit
+    def jitted_render(gaussians, W2C, full_proj):
+        # Create camera object with static W, H from closure
+        # and dynamic W2C, full_proj from arguments
+        curr_cam = Camera(
+            W=W, H=H,
+            fx=500.0, fy=500.0,
+            cx=W/2, cy=H/2,
+            W2C=W2C,
+            full_proj=full_proj
+        )
+        return render(gaussians, curr_cam)
+    
     # JIT Warm-up
     print("Warming up (JIT)...")
     start_warm = time.perf_counter()
-    image = render(gaussians, cam)
+    image = jitted_render(gaussians, cam.W2C, cam.full_proj)
     jax.block_until_ready(image)
     end_warm = time.perf_counter()
     print(f"Warm-up took {end_warm - start_warm:.4f}s")
@@ -43,7 +59,7 @@ def test_benchmark_renderer():
     times = []
     for i in range(num_runs):
         start = time.perf_counter()
-        image = render(gaussians, cam)
+        image = jitted_render(gaussians, cam.W2C, cam.full_proj)
         jax.block_until_ready(image)
         end = time.perf_counter()
         times.append(end - start)
