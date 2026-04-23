@@ -37,7 +37,7 @@ def test_benchmark_renderer():
     print(f"Warm-up took {end_warm - start_warm:.4f}s")
     
     # Benchmark runs
-    num_runs = 5
+    num_runs = 20
     print(f"Running benchmark ({num_runs} iterations)...")
     
     times = []
