@@ -42,7 +42,7 @@ def test_benchmark_renderer():
             W2C=W2C,
             full_proj=full_proj
         )
-        return render(gaussians, curr_cam)
+        return render(gaussians, curr_cam, use_pallas=True)
     
     # JIT Warm-up
     print("Warming up (JIT)...")
