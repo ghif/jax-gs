@@ -33,9 +33,9 @@ def rasterize_kernel(
     T = jnp.ones((tile_size, tile_size), dtype=jnp.float32)
     
     # Pixel grid for this tile
-    # Using jnp.arange and broadcasting instead of mgrid inside kernel for better compatibility
-    ys = jnp.arange(tile_size, dtype=jnp.float32) + pix_min_y
-    xs = jnp.arange(tile_size, dtype=jnp.float32) + pix_min_x
+    # TPU Mosaic iota requires integer types, so arange then cast
+    ys = jnp.arange(tile_size).astype(jnp.float32) + pix_min_y.astype(jnp.float32)
+    xs = jnp.arange(tile_size).astype(jnp.float32) + pix_min_x.astype(jnp.float32)
     grid_x = xs[None, :]
     grid_y = ys[:, None]
 
