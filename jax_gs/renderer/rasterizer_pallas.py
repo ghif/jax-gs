@@ -32,12 +32,11 @@ def rasterize_kernel(
     accum_color = jnp.zeros((tile_size, tile_size, 3), dtype=jnp.float32)
     T = jnp.ones((tile_size, tile_size), dtype=jnp.float32)
     
-    # Pixel grid for this tile
-    # TPU Mosaic iota requires integer types, so arange then cast
-    ys = jnp.arange(tile_size).astype(jnp.float32) + pix_min_y.astype(jnp.float32)
-    xs = jnp.arange(tile_size).astype(jnp.float32) + pix_min_x.astype(jnp.float32)
-    grid_x = xs[None, :]
-    grid_y = ys[:, None]
+    # Pre-generate pixel grid coordinates for this tile. 
+    # Use jnp.mgrid which is more stable across JAX versions for Pallas kernels.
+    py, px = jnp.mgrid[0:tile_size, 0:tile_size]
+    grid_x = pix_min_x + px.astype(jnp.float32)
+    grid_y = pix_min_y + py.astype(jnp.float32)
 
     def loop_body(i, carry):
         accum_color, T = carry
