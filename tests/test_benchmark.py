@@ -2,17 +2,19 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import time
+import argparse
 from jax_gs.core.gaussians import init_gaussians_from_pcd
 from jax_gs.core.camera import Camera
 from jax_gs.renderer.renderer import render
 
-def test_benchmark_renderer():
+def test_benchmark_renderer(use_pallas=False):
     """
     Benchmark the JAX renderer performance.
     """
     # Check JAX version and device
     print(f"JAX Version: {jax.__version__}")
     print(f"JAX Devices: {jax.devices()}")
+    print(f"Using Pallas: {use_pallas}")
 
     # 1. Setup Data (Scale of Fern Dataset @ 1/8 res)
     num_points = 150_000
@@ -46,7 +48,7 @@ def test_benchmark_renderer():
             W2C=W2C,
             full_proj=full_proj
         )
-        return render(gaussians, curr_cam, use_pallas=False)
+        return render(gaussians, curr_cam, use_pallas=use_pallas)
     
     # JIT Warm-up
     print("Warming up (JIT)...")
@@ -78,5 +80,9 @@ def test_benchmark_renderer():
     assert avg_time < 5.0 # Sanity check for CPU, should be much faster on GPU
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Benchmark JAX Gaussian Splatting renderer.")
+    parser.add_argument("--pallas", action="store_true", help="Use Pallas renderer (optimized for TPU/GPU).")
+    args = parser.parse_args()
+
     # If running directly, execute the benchmark
-    test_benchmark_renderer()
+    test_benchmark_renderer(use_pallas=args.pallas)
