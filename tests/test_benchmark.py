@@ -79,9 +79,20 @@ def test_benchmark_renderer(use_pallas=False):
     
     assert avg_time < 5.0 # Sanity check for CPU, should be much faster on GPU
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark JAX Gaussian Splatting renderer.")
-    parser.add_argument("--pallas", action="store_true", help="Use Pallas renderer (optimized for TPU/GPU).")
+    parser.add_argument("--pallas", type=str2bool, nargs='?', const=True, default=False, 
+                        help="Use Pallas renderer (True/False or just --pallas for True).")
     args = parser.parse_args()
 
     # If running directly, execute the benchmark
