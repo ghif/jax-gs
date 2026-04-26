@@ -29,7 +29,8 @@ def rasterize_kernel(
     pix_min_y = tile_y * tile_size
     
     # Initialize accumulators
-    accum_color = jnp.zeros((tile_size, tile_size, 3), dtype=jnp.float32)
+    # Triton requires power-of-2 dimensions, so we use 4 instead of 3 for colors
+    accum_color = jnp.zeros((tile_size, tile_size, 4), dtype=jnp.float32)
     T = jnp.ones((tile_size, tile_size), dtype=jnp.float32)
     
     # Pre-generate pixel grid coordinates for this tile
@@ -53,7 +54,7 @@ def rasterize_kernel(
         mu = means2D_ref[idx]
         icov = inv_cov2D_ref[idx]
         op = sig_opacities_ref[idx, 0]
-        col = colors_ref[idx]
+        col = colors_ref[idx] # This is now (4,)
         
         dx = grid_x - mu[0]
         dy = grid_y - mu[1]
@@ -105,15 +106,19 @@ def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sort
     tile_indices = jnp.arange(num_tiles + 1)
     tile_boundaries = jnp.searchsorted(sorted_tile_ids, tile_indices)
 
+    # Pad colors and background to 4 components (power-of-2 for Triton)
+    colors_padded = jnp.concatenate([colors, jnp.zeros((colors.shape[0], 1))], axis=-1)
+    background_padded = jnp.concatenate([background, jnp.zeros((1,))])
+
     # Define the output shape as a padded image (to simplify BlockSpec mapping)
     out_shape = jax.ShapeDtypeStruct(
-        (num_tiles_y * tile_size, num_tiles_x * tile_size, 3), 
+        (num_tiles_y * tile_size, num_tiles_x * tile_size, 4), 
         jnp.float32
     )
     
     # Output BlockSpec mapping: (tx, ty) -> (ty*tile_size, tx*tile_size)
     out_specs = pl.BlockSpec(
-        (tile_size, tile_size, 3), 
+        (tile_size, tile_size, 4), 
         lambda tx, ty: (ty * tile_size, tx * tile_size, 0)
     )
 
@@ -133,9 +138,10 @@ def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sort
         out_specs=out_specs,
         interpret=is_cpu
     )(
-        means2D, inv_cov2D, sig_opacities, colors,
-        sorted_gaussian_ids, tile_boundaries, background
+        means2D, inv_cov2D, sig_opacities, colors_padded,
+        sorted_gaussian_ids, tile_boundaries, background_padded
     )
     
-    # Crop to actual image size
-    return out_image[:H, :W, :]
+    # Crop to actual image size and drop the 4th channel
+    return out_image[:H, :W, :3]
+
