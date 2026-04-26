@@ -70,7 +70,10 @@ def rasterize_kernel(
         c1 = colors_T_ref[1, i]
         c2 = colors_T_ref[2, i]
         c3 = colors_T_ref[3, i]
-        col = jnp.stack([c0, c1, c2, c3])
+        # Use binary stacks/concats to avoid Triton lowering limitation (max 2 args)
+        col_rg = jnp.stack([c0, c1])
+        col_ba = jnp.stack([c2, c3])
+        col = jnp.concatenate([col_rg, col_ba])
 
         # Alpha blending
         weight = (alpha * T)[..., None]
@@ -90,7 +93,10 @@ def rasterize_kernel(
     bg1 = background_ref[1]
     bg2 = background_ref[2]
     bg3 = background_ref[3]
-    bg = jnp.stack([bg0, bg1, bg2, bg3])
+    # Use binary stacks/concats to avoid Triton lowering limitation (max 2 args)
+    bg_rg = jnp.stack([bg0, bg1])
+    bg_ba = jnp.stack([bg2, bg3])
+    bg = jnp.concatenate([bg_rg, bg_ba])
 
     out_grid_ref[...] = jnp.nan_to_num(final_color + final_T[..., None] * bg)
 
