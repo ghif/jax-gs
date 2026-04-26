@@ -33,8 +33,7 @@ def rasterize_kernel(
     T = jnp.ones((tile_size, tile_size), dtype=jnp.float32)
     
     # Pre-generate pixel grid coordinates for this tile. 
-    # Use jnp.mgrid which is more stable across JAX versions for Pallas kernels.
-    py, px = jnp.mgrid[0:tile_size, 0:tile_size]
+    py, px = jnp.meshgrid(jnp.arange(tile_size), jnp.arange(tile_size), indexing='ij')
     grid_x = pix_min_x + px.astype(jnp.float32)
     grid_y = pix_min_y + py.astype(jnp.float32)
 
