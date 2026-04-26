@@ -65,19 +65,25 @@ def rasterize_kernel(
         is_active = (power > -10.0) & (grid_x < W) & (grid_y < H) & (T > 1e-4)
         alpha = jnp.where(is_active, jnp.minimum(0.99, alpha), 0.0)
 
-        # Load color components explicitly
+        # Load color components
         c0 = colors_T_ref[0, i]
         c1 = colors_T_ref[1, i]
         c2 = colors_T_ref[2, i]
         c3 = colors_T_ref[3, i]
-        # Use binary stacks/concats to avoid Triton lowering limitation (max 2 args)
-        col_rg = jnp.stack([c0, c1])
-        col_ba = jnp.stack([c2, c3])
-        col = jnp.concatenate([col_rg, col_ba])
-
-        # Alpha blending
-        weight = (alpha * T)[..., None]
-        accum_color = accum_color + weight * col
+        
+        # Alpha blending: Update each channel separately to avoid concatenate/stack primitives
+        # Triton lowering has limitations on concatenate/stack of non-singleton dimensions.
+        # accum_color is (TILE_SIZE, TILE_SIZE, 4), weight is (TILE_SIZE, TILE_SIZE)
+        weight = alpha * T
+        
+        # Use broadcasting to update the 4th dimension without explicit vector construction
+        # (TILE_SIZE, TILE_SIZE, 1) * (4,) where (4,) is a one-hot mask
+        indices = jnp.arange(4)
+        accum_color = accum_color + (weight[..., None] * c0) * (indices == 0).astype(jnp.float32)
+        accum_color = accum_color + (weight[..., None] * c1) * (indices == 1).astype(jnp.float32)
+        accum_color = accum_color + (weight[..., None] * c2) * (indices == 2).astype(jnp.float32)
+        accum_color = accum_color + (weight[..., None] * c3) * (indices == 3).astype(jnp.float32)
+        
         T = T * (1.0 - alpha)
         
         # Stability check
@@ -88,17 +94,19 @@ def rasterize_kernel(
 
     _, final_color, final_T = jax.lax.while_loop(cond_fn, body_fn, (start_idx, accum_color, T))
 
-    # Apply background color
+    # Apply background color channel-wise
     bg0 = background_ref[0]
     bg1 = background_ref[1]
     bg2 = background_ref[2]
     bg3 = background_ref[3]
-    # Use binary stacks/concats to avoid Triton lowering limitation (max 2 args)
-    bg_rg = jnp.stack([bg0, bg1])
-    bg_ba = jnp.stack([bg2, bg3])
-    bg = jnp.concatenate([bg_rg, bg_ba])
+    
+    indices = jnp.arange(4)
+    final_color = final_color + (final_T[..., None] * bg0) * (indices == 0).astype(jnp.float32)
+    final_color = final_color + (final_T[..., None] * bg1) * (indices == 1).astype(jnp.float32)
+    final_color = final_color + (final_T[..., None] * bg2) * (indices == 2).astype(jnp.float32)
+    final_color = final_color + (final_T[..., None] * bg3) * (indices == 3).astype(jnp.float32)
 
-    out_grid_ref[...] = jnp.nan_to_num(final_color + final_T[..., None] * bg)
+    out_grid_ref[...] = jnp.nan_to_num(final_color)
 
 
 def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaussian_ids, 
