@@ -10,6 +10,10 @@ def test_benchmark_renderer():
     """
     Benchmark the JAX renderer performance.
     """
+    # Check JAX version and device
+    print(f"JAX Version: {jax.__version__}")
+    print(f"JAX Devices: {jax.devices()}")
+    
     # 1. Setup Data (Scale of Fern Dataset @ 1/8 res)
     num_points = 150_000
     W, H = 504, 378
