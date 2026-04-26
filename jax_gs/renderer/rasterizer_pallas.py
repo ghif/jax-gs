@@ -61,6 +61,9 @@ def rasterize_kernel(
         
         # Compute Gaussian influence
         power = -0.5 * (dx * dx * icov[0, 0] + dx * dy * 2.0 * icov[0, 1] + dy * dy * icov[1, 1])
+        
+        # Clamp power to avoid exp overflow/underflow
+        power = jnp.maximum(power, -100.0)
         alpha = jnp.exp(power) * op
         
         # Visibility check
@@ -144,4 +147,3 @@ def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sort
     
     # Crop to actual image size and drop the 4th channel
     return out_image[:H, :W, :3]
-
