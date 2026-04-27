@@ -110,13 +110,13 @@ def rasterize_kernel_gpu(
 
 
 def rasterize_kernel_tpu(
-    g_packed_ref, background_ref,
+    g_means_ref, g_icov_ref, g_ops_ref, g_cols_ref, g_mask_ref, background_ref,
     out_grid_ref,
     *, W, H
 ):
     """
     Optimized Pallas kernel for TPU (Mosaic).
-    Uses packed attributes and jax.lax.scan for maximal hardware pipelining.
+    Uses pre-gathered attributes and fori_loop for hardware pipelining.
     """
     # Grid mapping
     ty = pl.program_id(0)
@@ -125,58 +125,92 @@ def rasterize_kernel_tpu(
     pix_min_x = (tx * TILE_SIZE).astype(jnp.float32)
     pix_min_y = (ty * TILE_SIZE).astype(jnp.float32)
     
-    # Initialize accumulators in VMEM
-    accum_color = jnp.zeros((TILE_SIZE, TILE_SIZE, 4), dtype=jnp.float32)
-    T = jnp.ones((TILE_SIZE, TILE_SIZE), dtype=jnp.float32)
-    
-    # Pre-generate pixel grid coordinates for this tile
+    # Pre-generate pixel grid coordinates for this tile, flattened for TPU efficiency
     py, px = jnp.meshgrid(jnp.arange(TILE_SIZE, dtype=jnp.int32).astype(jnp.float32), 
                           jnp.arange(TILE_SIZE, dtype=jnp.int32).astype(jnp.float32), 
                           indexing='ij')
-    grid_x = pix_min_x + px
-    grid_y = pix_min_y + py
+    grid_x = (pix_min_x + px).flatten() # Shape (256,)
+    grid_y = (pix_min_y + py).flatten() # Shape (256,)
 
-    # Load packed attribute block into VMEM once to avoid slow scalar Ref gathers
-    packed_data = g_packed_ref[...]
+    # Initialize accumulators as 1D vectors to perfectly fill TPU registers (8x128)
+    c0_accum = jnp.zeros((256,), dtype=jnp.float32)
+    c1_accum = jnp.zeros((256,), dtype=jnp.float32)
+    c2_accum = jnp.zeros((256,), dtype=jnp.float32)
+    c3_accum = jnp.zeros((256,), dtype=jnp.float32)
+    T = jnp.ones((256,), dtype=jnp.float32)
 
-    for j in range(BLOCK_SIZE):
-        # Static slice (Python integer j) is much faster on TPU than dynamic pl.ds
-        packed_val = packed_data[j]
+    # Load all attribute blocks once to VMEM. 
+    # Use chunked processing to enable vectorized loads and tile-level early termination.
+    CHUNK_SIZE = 16
+    num_chunks = BLOCK_SIZE // CHUNK_SIZE
+
+    def chunk_body(chunk_idx, state):
+        c0_accum, c1_accum, c2_accum, c3_accum, T = state
         
-        # Unpack the 12-channel vector
-        # [mu_x, mu_y, icov_00, icov_01, icov_10, icov_11, op, c0, c1, c2, c3, mask]
-        mu_x = packed_val[0]
-        mu_y = packed_val[1]
-        icov_00 = packed_val[2]
-        icov_01 = packed_val[3]
-        icov_11 = packed_val[5]
-        op = packed_val[6]
-        c = packed_val[7:11]
-        mask = packed_val[11].astype(bool)
+        # Load a chunk of 16 Gaussians into vector registers using pl.ds (BLOCK LOAD)
+        # This is MUCH faster on TPU than individual scalar loads.
+        curr_start = chunk_idx * CHUNK_SIZE
+        mu_chunk = g_means_ref[pl.ds(curr_start, CHUNK_SIZE), :]
+        icov_chunk = g_icov_ref[pl.ds(curr_start, CHUNK_SIZE), :]
+        op_chunk = g_ops_ref[pl.ds(curr_start, CHUNK_SIZE), 0]
+        col_chunk = g_cols_ref[pl.ds(curr_start, CHUNK_SIZE), :]
+        mask_chunk = g_mask_ref[pl.ds(curr_start, CHUNK_SIZE), 0]
 
-        dx = grid_x - mu_x
-        dy = grid_y - mu_y
+        def process_gaussians(inner_state):
+            c0, c1, c2, c3, curr_T = inner_state
+            
+            # Small, fully unrolled inner loop for maximal pipelining without compiler bloat
+            for l in range(CHUNK_SIZE):
+                mu_x = mu_chunk[l, 0]
+                mu_y = mu_chunk[l, 1]
+                icov_00 = icov_chunk[l, 0]
+                icov_01 = icov_chunk[l, 1]
+                icov_11 = icov_chunk[l, 3]
+                op = op_chunk[l]
+                color = col_chunk[l, :]
+                mask = mask_chunk[l].astype(bool)
 
-        # Compute Gaussian influence
-        power = -0.5 * (dx * dx * icov_00 + dx * dy * 2.0 * icov_01 + dy * dy * icov_11)
-        alpha = jnp.exp(jnp.clip(power, -100.0, 0.0)) * op
-        
-        # Mask inactive or saturated pixels
-        is_active = mask & (power > -10.0) & (grid_x < W) & (grid_y < H) & (T > 1e-4)
-        alpha = jnp.where(is_active, jnp.minimum(0.99, alpha), 0.0)
+                dx = grid_x - mu_x
+                dy = grid_y - mu_y
 
-        weight = alpha * T
-        
-        # Direct vectorized alpha blending (much faster on TPU)
-        accum_color = accum_color + weight[..., None] * c[None, None, :]
-        T = T * (1.0 - alpha)
+                # Compute Gaussian influence
+                power = -0.5 * (dx * dx * icov_00 + dx * dy * 2.0 * icov_01 + dy * dy * icov_11)
+                alpha = jnp.exp(jnp.clip(power, -100.0, 0.0)) * op
+                
+                # Mask inactive or saturated pixels
+                is_active = mask & (power > -10.0) & (grid_x < W) & (grid_y < H) & (curr_T > 1e-4)
+                alpha = jnp.where(is_active, jnp.minimum(0.99, alpha), 0.0)
 
-    # Apply background color
-    bg = background_ref[...]
-    accum_color = accum_color + T[..., None] * bg[None, None, :]
+                weight = alpha * curr_T
+                
+                # Vectorized accumulation across 256 pixels simultaneously
+                c0 = c0 + weight * color[0]
+                c1 = c1 + weight * color[1]
+                c2 = c2 + weight * color[2]
+                c3 = c3 + weight * color[3]
+                curr_T = curr_T * (1.0 - alpha)
+                
+            return c0, c1, c2, c3, curr_T
+
+        # Tile-level early termination: skip the chunk if the tile is already fully opaque
+        return jax.lax.cond(jnp.max(T) >= 1e-4, process_gaussians, lambda s: s, (c0_accum, c1_accum, c2_accum, c3_accum, T))
+
+    # Outer loop over chunks for efficient hardware scheduling
+    c0_accum, c1_accum, c2_accum, c3_accum, T = jax.lax.fori_loop(0, num_chunks, chunk_body, (c0_accum, c1_accum, c2_accum, c3_accum, T))
+
+    # Apply background color to 1D vectors
+    bg = background_ref[...] # (4,)
+    c0_accum = c0_accum + T * bg[0]
+    c1_accum = c1_accum + T * bg[1]
+    c2_accum = c2_accum + T * bg[2]
+    c3_accum = c3_accum + T * bg[3]
+
+    # Reconstruct 3D output block from channels and reshape for storage
+    final_color = jnp.stack([c0_accum, c1_accum, c2_accum, c3_accum], axis=-1)
+    final_color = final_color.reshape(TILE_SIZE, TILE_SIZE, 4)
 
     # Store result back to HBM
-    out_grid_ref[...] = jnp.nan_to_num(accum_color)
+    out_grid_ref[...] = jnp.nan_to_num(final_color)
 
 
 def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaussian_ids, 
@@ -239,24 +273,25 @@ def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sort
             gather_indices = jnp.clip(start_idx + jnp.arange(BLOCK_SIZE), 0, means2D_sorted.shape[0] - 1)
             local_mask = (start_idx + jnp.arange(BLOCK_SIZE)) < (start_idx + count)
             
-            # Pack all attributes into a single 12-channel array to bypass Scan arg limits
-            return jnp.concatenate([
-                means2D_sorted[gather_indices],          # 2
-                inv_cov2D_sorted[gather_indices],        # 4
-                opacities_sorted[gather_indices, None],  # 1
-                colors_sorted[gather_indices],           # 4
-                local_mask[:, None].astype(jnp.float32)  # 1
-            ], axis=-1)
+            return (means2D_sorted[gather_indices], 
+                    inv_cov2D_sorted[gather_indices], 
+                    opacities_sorted[gather_indices, None], 
+                    colors_sorted[gather_indices], 
+                    local_mask[:, None].astype(jnp.float32))
 
         # Vectorize over grid
         grid_y = jnp.arange(num_tiles_y)
         grid_x = jnp.arange(num_tiles_x)
         # Nested vmap for 2D grid
         tile_data_fn = jax.vmap(jax.vmap(get_tile_data, in_axes=(None, 0)), in_axes=(0, None))
-        g_packed = tile_data_fn(grid_y, grid_x)
+        g_means, g_icov, g_ops, g_cols, g_mask = tile_data_fn(grid_y, grid_x)
 
         in_specs = [
-            pl.BlockSpec((None, None, BLOCK_SIZE, 12), lambda ty, tx: (ty, tx, 0, 0)),
+            pl.BlockSpec((None, None, BLOCK_SIZE, 2), lambda ty, tx: (ty, tx, 0, 0)),
+            pl.BlockSpec((None, None, BLOCK_SIZE, 4), lambda ty, tx: (ty, tx, 0, 0)),
+            pl.BlockSpec((None, None, BLOCK_SIZE, 1), lambda ty, tx: (ty, tx, 0, 0)),
+            pl.BlockSpec((None, None, BLOCK_SIZE, 4), lambda ty, tx: (ty, tx, 0, 0)),
+            pl.BlockSpec((None, None, BLOCK_SIZE, 1), lambda ty, tx: (ty, tx, 0, 0)),
             pl.BlockSpec() # background
         ]
 
@@ -267,7 +302,7 @@ def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sort
             in_specs=in_specs,
             out_specs=out_specs,
             interpret=is_cpu
-        )(g_packed, background_padded)
+        )(g_means, g_icov, g_ops, g_cols, g_mask, background_padded)
     else:
         # GPU path: uses dynamic indexing directly from HBM (allowed in Triton)
         out_image = pl.pallas_call(
