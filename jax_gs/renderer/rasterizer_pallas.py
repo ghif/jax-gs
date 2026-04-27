@@ -144,14 +144,14 @@ def rasterize_kernel_tpu(
         j, accum_color, T = state
         
         # Load from VMEM reference (perfectly aligned via BlockSpec)
-        # References are (1, 1, BLOCK_SIZE, ...)
-        mu_x = g_means_ref[0, 0, j, 0]
-        mu_y = g_means_ref[0, 0, j, 1]
-        icov_00 = g_icov_ref[0, 0, j, 0]
-        icov_01 = g_icov_ref[0, 0, j, 1]
-        icov_11 = g_icov_ref[0, 0, j, 3]
-        op = g_ops_ref[0, 0, j]
-        mask = g_mask_ref[0, 0, j]
+        # References are (BLOCK_SIZE, ...)
+        mu_x = g_means_ref[j, 0]
+        mu_y = g_means_ref[j, 1]
+        icov_00 = g_icov_ref[j, 0]
+        icov_01 = g_icov_ref[j, 1]
+        icov_11 = g_icov_ref[j, 3]
+        op = g_ops_ref[j, 0]
+        mask = g_mask_ref[j, 0]
 
         dx = grid_x - mu_x
         dy = grid_y - mu_y
@@ -165,10 +165,10 @@ def rasterize_kernel_tpu(
         alpha = jnp.where(is_active, jnp.minimum(0.99, alpha), 0.0)
 
         # Load color components from VMEM
-        c0 = g_cols_ref[0, 0, j, 0]
-        c1 = g_cols_ref[0, 0, j, 1]
-        c2 = g_cols_ref[0, 0, j, 2]
-        c3 = g_cols_ref[0, 0, j, 3]
+        c0 = g_cols_ref[j, 0]
+        c1 = g_cols_ref[j, 1]
+        c2 = g_cols_ref[j, 2]
+        c3 = g_cols_ref[j, 3]
         
         weight = alpha * T
         
@@ -256,9 +256,9 @@ def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sort
             
             return (means2D_sorted[gather_indices], 
                     inv_cov2D_sorted[gather_indices], 
-                    opacities_sorted[gather_indices], 
+                    opacities_sorted[gather_indices, None], 
                     colors_sorted[gather_indices], 
-                    local_mask)
+                    local_mask[:, None])
 
         # Vectorize over grid
         grid_y = jnp.arange(num_tiles_y)
@@ -268,11 +268,11 @@ def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sort
         g_means, g_icov, g_ops, g_cols, g_mask = tile_data_fn(grid_y, grid_x)
 
         in_specs = [
-            pl.BlockSpec((1, 1, BLOCK_SIZE, 2), lambda ty, tx: (ty, tx, 0, 0)),
-            pl.BlockSpec((1, 1, BLOCK_SIZE, 4), lambda ty, tx: (ty, tx, 0, 0)),
-            pl.BlockSpec((1, 1, BLOCK_SIZE), lambda ty, tx: (ty, tx, 0)),
-            pl.BlockSpec((1, 1, BLOCK_SIZE, 4), lambda ty, tx: (ty, tx, 0, 0)),
-            pl.BlockSpec((1, 1, BLOCK_SIZE), lambda ty, tx: (ty, tx, 0)),
+            pl.BlockSpec((None, None, BLOCK_SIZE, 2), lambda ty, tx: (ty, tx, 0, 0)),
+            pl.BlockSpec((None, None, BLOCK_SIZE, 4), lambda ty, tx: (ty, tx, 0, 0)),
+            pl.BlockSpec((None, None, BLOCK_SIZE, 1), lambda ty, tx: (ty, tx, 0, 0)),
+            pl.BlockSpec((None, None, BLOCK_SIZE, 4), lambda ty, tx: (ty, tx, 0, 0)),
+            pl.BlockSpec((None, None, BLOCK_SIZE, 1), lambda ty, tx: (ty, tx, 0, 0)),
             pl.BlockSpec(memory_space=pl.ANY) # background
         ]
 
