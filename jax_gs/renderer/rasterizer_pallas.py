@@ -136,12 +136,8 @@ def rasterize_kernel_tpu(
     grid_x = pix_min_x + px
     grid_y = pix_min_y + py
 
-    def cond_fn(state):
-        j, _, T = state
-        return (j < BLOCK_SIZE) & (jnp.max(T) >= 1e-4)
-
-    def body_fn(state):
-        j, accum_color, T = state
+    def body_fn(j, state):
+        accum_color, T = state
         
         # Load from VMEM reference (perfectly aligned via BlockSpec)
         # References are (BLOCK_SIZE, ...)
@@ -164,27 +160,18 @@ def rasterize_kernel_tpu(
         is_active = mask & (power > -10.0) & (grid_x < W) & (grid_y < H) & (T > 1e-4)
         alpha = jnp.where(is_active, jnp.minimum(0.99, alpha), 0.0)
 
-        # Load color components from VMEM
-        c0 = g_cols_ref[j, 0]
-        c1 = g_cols_ref[j, 1]
-        c2 = g_cols_ref[j, 2]
-        c3 = g_cols_ref[j, 3]
-        
+        # Load color components from VMEM as a vector
+        c = g_cols_ref[j, :]
         weight = alpha * T
         
-        # Vectorized alpha blending
-        indices = jnp.arange(4)
-        accum_color = accum_color + (weight[..., None] * c0) * (indices == 0).astype(jnp.float32)
-        accum_color = accum_color + (weight[..., None] * c1) * (indices == 1).astype(jnp.float32)
-        accum_color = accum_color + (weight[..., None] * c2) * (indices == 2).astype(jnp.float32)
-        accum_color = accum_color + (weight[..., None] * c3) * (indices == 3).astype(jnp.float32)
-        
+        # Direct vectorized alpha blending (much faster on TPU)
+        accum_color = accum_color + weight[..., None] * c[None, None, :]
         T = T * (1.0 - alpha)
         
-        return j + 1, accum_color, T
+        return accum_color, T
 
-    # Main loop over pre-gathered Gaussians with early termination
-    _, final_color, final_T = jax.lax.while_loop(cond_fn, body_fn, (0, accum_color, T))
+    # Main loop over pre-gathered Gaussians (Fixed loop for better TPU pipelining)
+    final_color, final_T = jax.lax.fori_loop(0, BLOCK_SIZE, body_fn, (accum_color, T))
 
     # Apply background color
     bg = background_ref[...]
