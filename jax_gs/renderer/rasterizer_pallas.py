@@ -110,13 +110,13 @@ def rasterize_kernel_gpu(
 
 
 def rasterize_kernel_tpu(
-    g_means_ref, g_icov_ref, g_ops_ref, g_cols_ref, g_mask_ref, background_ref,
+    g_packed_ref, background_ref,
     out_grid_ref,
     *, W, H
 ):
     """
     Optimized Pallas kernel for TPU (Mosaic).
-    Uses pre-gathered attributes for perfectly aligned VMEM access.
+    Uses packed attributes and jax.lax.scan for maximal hardware pipelining.
     """
     # Grid mapping
     ty = pl.program_id(0)
@@ -136,17 +136,22 @@ def rasterize_kernel_tpu(
     grid_x = pix_min_x + px
     grid_y = pix_min_y + py
 
-    def body_fn(j, state):
-        accum_color, T = state
+    # Load packed attribute block into VMEM once to avoid slow scalar Ref gathers
+    packed_data = g_packed_ref[...]
+
+    def scan_body(carry, packed_val):
+        accum_color, T = carry
         
-        # Load from VMEM reference using pl.ds for dynamic slicing (Mosaic requirement)
-        mu_x = g_means_ref[pl.ds(j, 1), 0][0]
-        mu_y = g_means_ref[pl.ds(j, 1), 1][0]
-        icov_00 = g_icov_ref[pl.ds(j, 1), 0][0]
-        icov_01 = g_icov_ref[pl.ds(j, 1), 1][0]
-        icov_11 = g_icov_ref[pl.ds(j, 1), 3][0]
-        op = g_ops_ref[pl.ds(j, 1), 0][0]
-        mask = g_mask_ref[pl.ds(j, 1), 0][0].astype(bool)
+        # Unpack the 12-channel vector
+        # [mu_x, mu_y, icov_00, icov_01, icov_10, icov_11, op, c0, c1, c2, c3, mask]
+        mu_x = packed_val[0]
+        mu_y = packed_val[1]
+        icov_00 = packed_val[2]
+        icov_01 = packed_val[3]
+        icov_11 = packed_val[5]
+        op = packed_val[6]
+        c = packed_val[7:11]
+        mask = packed_val[11].astype(bool)
 
         dx = grid_x - mu_x
         dy = grid_y - mu_y
@@ -159,18 +164,16 @@ def rasterize_kernel_tpu(
         is_active = mask & (power > -10.0) & (grid_x < W) & (grid_y < H) & (T > 1e-4)
         alpha = jnp.where(is_active, jnp.minimum(0.99, alpha), 0.0)
 
-        # Load color components from VMEM as a vector slice
-        c = g_cols_ref[pl.ds(j, 1), :][0]
         weight = alpha * T
         
         # Direct vectorized alpha blending (much faster on TPU)
         accum_color = accum_color + weight[..., None] * c[None, None, :]
         T = T * (1.0 - alpha)
         
-        return accum_color, T
+        return (accum_color, T), None
 
-    # Main loop over pre-gathered Gaussians (Fixed loop for better TPU pipelining)
-    final_color, final_T = jax.lax.fori_loop(0, BLOCK_SIZE, body_fn, (accum_color, T))
+    # Main loop over pre-gathered Gaussians using scan for optimal XLA pipelining
+    (final_color, final_T), _ = jax.lax.scan(scan_body, (accum_color, T), packed_data)
 
     # Apply background color
     bg = background_ref[...]
@@ -240,25 +243,24 @@ def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sort
             gather_indices = jnp.clip(start_idx + jnp.arange(BLOCK_SIZE), 0, means2D_sorted.shape[0] - 1)
             local_mask = (start_idx + jnp.arange(BLOCK_SIZE)) < (start_idx + count)
             
-            return (means2D_sorted[gather_indices], 
-                    inv_cov2D_sorted[gather_indices], 
-                    opacities_sorted[gather_indices, None], 
-                    colors_sorted[gather_indices], 
-                    local_mask[:, None].astype(jnp.int32))
+            # Pack all attributes into a single 12-channel array to bypass Scan arg limits
+            return jnp.concatenate([
+                means2D_sorted[gather_indices],          # 2
+                inv_cov2D_sorted[gather_indices],        # 4
+                opacities_sorted[gather_indices, None],  # 1
+                colors_sorted[gather_indices],           # 4
+                local_mask[:, None].astype(jnp.float32)  # 1
+            ], axis=-1)
 
         # Vectorize over grid
         grid_y = jnp.arange(num_tiles_y)
         grid_x = jnp.arange(num_tiles_x)
         # Nested vmap for 2D grid
         tile_data_fn = jax.vmap(jax.vmap(get_tile_data, in_axes=(None, 0)), in_axes=(0, None))
-        g_means, g_icov, g_ops, g_cols, g_mask = tile_data_fn(grid_y, grid_x)
+        g_packed = tile_data_fn(grid_y, grid_x)
 
         in_specs = [
-            pl.BlockSpec((None, None, BLOCK_SIZE, 2), lambda ty, tx: (ty, tx, 0, 0)),
-            pl.BlockSpec((None, None, BLOCK_SIZE, 4), lambda ty, tx: (ty, tx, 0, 0)),
-            pl.BlockSpec((None, None, BLOCK_SIZE, 1), lambda ty, tx: (ty, tx, 0, 0)),
-            pl.BlockSpec((None, None, BLOCK_SIZE, 4), lambda ty, tx: (ty, tx, 0, 0)),
-            pl.BlockSpec((None, None, BLOCK_SIZE, 1), lambda ty, tx: (ty, tx, 0, 0)),
+            pl.BlockSpec((None, None, BLOCK_SIZE, 12), lambda ty, tx: (ty, tx, 0, 0)),
             pl.BlockSpec() # background
         ]
 
@@ -269,7 +271,7 @@ def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sort
             in_specs=in_specs,
             out_specs=out_specs,
             interpret=is_cpu
-        )(g_means, g_icov, g_ops, g_cols, g_mask, background_padded)
+        )(g_packed, background_padded)
     else:
         # GPU path: uses dynamic indexing directly from HBM (allowed in Triton)
         out_image = pl.pallas_call(
