@@ -146,7 +146,7 @@ def rasterize_kernel_tpu(
         icov_01 = g_icov_ref[pl.ds(j, 1), 1][0]
         icov_11 = g_icov_ref[pl.ds(j, 1), 3][0]
         op = g_ops_ref[pl.ds(j, 1), 0][0]
-        mask = g_mask_ref[pl.ds(j, 1), 0][0]
+        mask = g_mask_ref[pl.ds(j, 1), 0][0].astype(bool)
 
         dx = grid_x - mu_x
         dy = grid_y - mu_y
@@ -244,7 +244,7 @@ def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sort
                     inv_cov2D_sorted[gather_indices], 
                     opacities_sorted[gather_indices, None], 
                     colors_sorted[gather_indices], 
-                    local_mask[:, None])
+                    local_mask[:, None].astype(jnp.int32))
 
         # Vectorize over grid
         grid_y = jnp.arange(num_tiles_y)
