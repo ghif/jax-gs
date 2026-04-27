@@ -152,12 +152,6 @@ def rasterize_kernel_tpu(
             accum_color, T = state
             curr_start = start_idx + chunk_idx * CHUNK_SIZE
             
-            # Load chunks of Gaussian attributes into VMEM using dynamic slicing (pl.ds)
-            m2d_chunk = means2D_T_ref[slice(None), pl.ds(curr_start, CHUNK_SIZE)]
-            icov_chunk = inv_cov2D_T_ref[slice(None), pl.ds(curr_start, CHUNK_SIZE)]
-            op_chunk = opacities_T_ref[pl.ds(curr_start, CHUNK_SIZE)]
-            col_chunk = colors_T_ref[slice(None), pl.ds(curr_start, CHUNK_SIZE)]
-
             def gaussian_body(j, state):
                 accum_color, T = state
                 i_global = curr_start + j
@@ -165,12 +159,13 @@ def rasterize_kernel_tpu(
                 # Bound check for the last partial chunk
                 mask = i_global < end_idx
                 
-                mu_x = m2d_chunk[0, j]
-                mu_y = m2d_chunk[1, j]
-                icov_00 = icov_chunk[0, j]
-                icov_01 = icov_chunk[1, j]
-                icov_11 = icov_chunk[3, j]
-                op = op_chunk[j]
+                # Use standard indexing (scalar load) instead of pl.ds on Ref
+                mu_x = means2D_T_ref[0, i_global]
+                mu_y = means2D_T_ref[1, i_global]
+                icov_00 = inv_cov2D_T_ref[0, i_global]
+                icov_01 = inv_cov2D_T_ref[1, i_global]
+                icov_11 = inv_cov2D_T_ref[3, i_global]
+                op = opacities_T_ref[i_global]
 
                 dx = grid_x - mu_x
                 dy = grid_y - mu_y
@@ -183,14 +178,24 @@ def rasterize_kernel_tpu(
                 is_active = mask & (power > -10.0) & (grid_x < W) & (grid_y < H) & (T > 1e-4)
                 alpha = jnp.where(is_active, jnp.minimum(0.99, alpha), 0.0)
 
-                c = col_chunk[:, j]
+                # Load color components element-wise
+                c0 = colors_T_ref[0, i_global]
+                c1 = colors_T_ref[1, i_global]
+                c2 = colors_T_ref[2, i_global]
+                c3 = colors_T_ref[3, i_global]
+                
                 weight = alpha * T
                 
                 # Vectorized alpha blending
-                new_accum_color = accum_color + weight[..., None] * c[None, None, :]
-                new_T = T * (1.0 - alpha)
+                indices = jnp.arange(4)
+                accum_color = accum_color + (weight[..., None] * c0) * (indices == 0).astype(jnp.float32)
+                accum_color = accum_color + (weight[..., None] * c1) * (indices == 1).astype(jnp.float32)
+                accum_color = accum_color + (weight[..., None] * c2) * (indices == 2).astype(jnp.float32)
+                accum_color = accum_color + (weight[..., None] * c3) * (indices == 3).astype(jnp.float32)
                 
-                return new_accum_color, new_T
+                T = T * (1.0 - alpha)
+                
+                return accum_color, T
 
             # Process the chunk of 16 Gaussians
             accum_color, T = jax.lax.fori_loop(0, CHUNK_SIZE, gaussian_body, (accum_color, T))
