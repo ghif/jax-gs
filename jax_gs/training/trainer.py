@@ -6,8 +6,8 @@ from jax_gs.training.losses import l1_loss, d_ssim_loss
 from jax_gs.core.camera import Camera
 import jax.numpy as jnp
 
-@partial(jax.jit, static_argnums=(3, 4))
-def train_step(state, target_image, w2c, camera_static, optimizer):
+@partial(jax.jit, static_argnums=(3, 4, 5))
+def train_step(state, target_image, w2c, camera_static, optimizer, use_pallas=False):
     """
     Standard training step.
     Args:
@@ -16,6 +16,7 @@ def train_step(state, target_image, w2c, camera_static, optimizer):
         w2c: (4, 4)
         camera_static: (W, H, fx, fy, cx, cy)
         optimizer: optax optimizer
+        use_pallas: Use Pallas backend for rasterization
     Returns:
         (next_params, next_opt_state), loss 
     """
@@ -27,7 +28,7 @@ def train_step(state, target_image, w2c, camera_static, optimizer):
     
     lambda_ssim = 0.2
     def loss_fn(p):
-        image = render(p, camera)
+        image = render(p, camera, use_pallas=use_pallas)
         l1 = l1_loss(image, target_image)
         d_ssim = d_ssim_loss(image, target_image)
         return (1.0 - lambda_ssim) * l1 + lambda_ssim * d_ssim
