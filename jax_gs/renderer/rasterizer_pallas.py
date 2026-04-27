@@ -31,7 +31,10 @@ def rasterize_kernel_gpu(
     pix_min_y = (ty * TILE_SIZE).astype(jnp.float32)
     
     # Initialize accumulators
-    accum_color = jnp.zeros((TILE_SIZE, TILE_SIZE, 4), dtype=jnp.float32)
+    c0_accum = jnp.zeros((TILE_SIZE, TILE_SIZE), dtype=jnp.float32)
+    c1_accum = jnp.zeros((TILE_SIZE, TILE_SIZE), dtype=jnp.float32)
+    c2_accum = jnp.zeros((TILE_SIZE, TILE_SIZE), dtype=jnp.float32)
+    c3_accum = jnp.zeros((TILE_SIZE, TILE_SIZE), dtype=jnp.float32)
     T = jnp.ones((TILE_SIZE, TILE_SIZE), dtype=jnp.float32)
     
     # Pre-generate pixel grid coordinates for this tile
@@ -42,11 +45,11 @@ def rasterize_kernel_gpu(
     grid_y = pix_min_y + py
 
     def cond_fn(state):
-        i, _, T = state
+        i, _, _, _, _, T = state
         return (i < end_idx) & (jnp.max(T) > 1e-4)
 
     def body_fn(state):
-        i, accum_color, T = state
+        i, c0_accum, c1_accum, c2_accum, c3_accum, T = state
 
         # Load attributes from SoA layout
         mu_x = means2D_T_ref[0, i]
@@ -73,39 +76,31 @@ def rasterize_kernel_gpu(
         c2 = colors_T_ref[2, i]
         c3 = colors_T_ref[3, i]
         
-        # Alpha blending: Update each channel separately to avoid concatenate/stack primitives
-        # Triton lowering has limitations on concatenate/stack of non-singleton dimensions.
         weight = alpha * T
-        
-        # Use broadcasting to update the 4th dimension without explicit vector construction
-        indices = jnp.arange(4)
-        accum_color = accum_color + (weight[..., None] * c0) * (indices == 0).astype(jnp.float32)
-        accum_color = accum_color + (weight[..., None] * c1) * (indices == 1).astype(jnp.float32)
-        accum_color = accum_color + (weight[..., None] * c2) * (indices == 2).astype(jnp.float32)
-        accum_color = accum_color + (weight[..., None] * c3) * (indices == 3).astype(jnp.float32)
-        
+        c0_accum = c0_accum + weight * c0
+        c1_accum = c1_accum + weight * c1
+        c2_accum = c2_accum + weight * c2
+        c3_accum = c3_accum + weight * c3
         T = T * (1.0 - alpha)
-        
-        # Stability check
-        accum_color = jnp.nan_to_num(accum_color)
-        T = jnp.nan_to_num(T)
 
-        return i + 1, accum_color, T
+        return i + 1, c0_accum, c1_accum, c2_accum, c3_accum, T
 
-    _, final_color, final_T = jax.lax.while_loop(cond_fn, body_fn, (start_idx, accum_color, T))
+    _, c0_final, c1_final, c2_final, c3_final, final_T = jax.lax.while_loop(
+        cond_fn, body_fn, (start_idx, c0_accum, c1_accum, c2_accum, c3_accum, T)
+    )
 
-    # Apply background color channel-wise
+    # Apply background color
     bg0 = background_ref[0]
     bg1 = background_ref[1]
     bg2 = background_ref[2]
     bg3 = background_ref[3]
     
-    indices = jnp.arange(4)
-    final_color = final_color + (final_T[..., None] * bg0) * (indices == 0).astype(jnp.float32)
-    final_color = final_color + (final_T[..., None] * bg1) * (indices == 1).astype(jnp.float32)
-    final_color = final_color + (final_T[..., None] * bg2) * (indices == 2).astype(jnp.float32)
-    final_color = final_color + (final_T[..., None] * bg3) * (indices == 3).astype(jnp.float32)
+    c0_final = c0_final + final_T * bg0
+    c1_final = c1_final + final_T * bg1
+    c2_final = c2_final + final_T * bg2
+    c3_final = c3_final + final_T * bg3
 
+    final_color = jnp.stack([c0_final, c1_final, c2_final, c3_final], axis=-1)
     out_grid_ref[...] = jnp.nan_to_num(final_color)
 
 
@@ -139,14 +134,12 @@ def rasterize_kernel_tpu(
     c3_accum = jnp.zeros((256,), dtype=jnp.float32)
     T = jnp.ones((256,), dtype=jnp.float32)
 
-    # Load all attribute blocks once to VMEM. 
-    # Use chunked processing to enable vectorized loads and tile-level early termination.
+    # Use a Python loop to fully unroll the blocks. 
+    # This avoids fori_loop overhead and allows the compiler to pipeline everything.
     CHUNK_SIZE = 16
     num_chunks = BLOCK_SIZE // CHUNK_SIZE
 
-    def chunk_body(chunk_idx, state):
-        c0_accum, c1_accum, c2_accum, c3_accum, T = state
-        
+    for chunk_idx in range(num_chunks):
         # Load a chunk of 16 Gaussians into vector registers using pl.ds (BLOCK LOAD)
         # This is MUCH faster on TPU than individual scalar loads.
         curr_start = chunk_idx * CHUNK_SIZE
@@ -156,47 +149,36 @@ def rasterize_kernel_tpu(
         col_chunk = g_cols_ref[pl.ds(curr_start, CHUNK_SIZE), :]
         mask_chunk = g_mask_ref[pl.ds(curr_start, CHUNK_SIZE), 0]
 
-        def process_gaussians(inner_state):
-            c0, c1, c2, c3, curr_T = inner_state
+        # Fully unroll Gaussian processing within the chunk
+        for l in range(CHUNK_SIZE):
+            mu_x = mu_chunk[l, 0]
+            mu_y = mu_chunk[l, 1]
+            icov_00 = icov_chunk[l, 0]
+            icov_01 = icov_chunk[l, 1]
+            icov_11 = icov_chunk[l, 3]
+            op = op_chunk[l]
+            color = col_chunk[l, :]
+            mask = mask_chunk[l].astype(bool)
+
+            dx = grid_x - mu_x
+            dy = grid_y - mu_y
+
+            # Compute Gaussian influence
+            power = -0.5 * (dx * dx * icov_00 + dx * dy * 2.0 * icov_01 + dy * dy * icov_11)
+            alpha = jnp.exp(jnp.clip(power, -100.0, 0.0)) * op
             
-            # Small, fully unrolled inner loop for maximal pipelining without compiler bloat
-            for l in range(CHUNK_SIZE):
-                mu_x = mu_chunk[l, 0]
-                mu_y = mu_chunk[l, 1]
-                icov_00 = icov_chunk[l, 0]
-                icov_01 = icov_chunk[l, 1]
-                icov_11 = icov_chunk[l, 3]
-                op = op_chunk[l]
-                color = col_chunk[l, :]
-                mask = mask_chunk[l].astype(bool)
+            # Mask inactive or saturated pixels
+            is_active = mask & (power > -10.0) & (grid_x < W) & (grid_y < H) & (T > 1e-4)
+            alpha = jnp.where(is_active, jnp.minimum(0.99, alpha), 0.0)
 
-                dx = grid_x - mu_x
-                dy = grid_y - mu_y
-
-                # Compute Gaussian influence
-                power = -0.5 * (dx * dx * icov_00 + dx * dy * 2.0 * icov_01 + dy * dy * icov_11)
-                alpha = jnp.exp(jnp.clip(power, -100.0, 0.0)) * op
-                
-                # Mask inactive or saturated pixels
-                is_active = mask & (power > -10.0) & (grid_x < W) & (grid_y < H) & (curr_T > 1e-4)
-                alpha = jnp.where(is_active, jnp.minimum(0.99, alpha), 0.0)
-
-                weight = alpha * curr_T
-                
-                # Vectorized accumulation across 256 pixels simultaneously
-                c0 = c0 + weight * color[0]
-                c1 = c1 + weight * color[1]
-                c2 = c2 + weight * color[2]
-                c3 = c3 + weight * color[3]
-                curr_T = curr_T * (1.0 - alpha)
-                
-            return c0, c1, c2, c3, curr_T
-
-        # Tile-level early termination: skip the chunk if the tile is already fully opaque
-        return jax.lax.cond(jnp.max(T) >= 1e-4, process_gaussians, lambda s: s, (c0_accum, c1_accum, c2_accum, c3_accum, T))
-
-    # Outer loop over chunks for efficient hardware scheduling
-    c0_accum, c1_accum, c2_accum, c3_accum, T = jax.lax.fori_loop(0, num_chunks, chunk_body, (c0_accum, c1_accum, c2_accum, c3_accum, T))
+            weight = alpha * T
+            
+            # Vectorized accumulation across 256 pixels simultaneously
+            c0_accum = c0_accum + weight * color[0]
+            c1_accum = c1_accum + weight * color[1]
+            c2_accum = c2_accum + weight * color[2]
+            c3_accum = c3_accum + weight * color[3]
+            T = T * (1.0 - alpha)
 
     # Apply background color to 1D vectors
     bg = background_ref[...] # (4,)
@@ -270,13 +252,18 @@ def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sort
             end_idx = tile_boundaries[tile_idx + 1]
             count = end_idx - start_idx
             
-            gather_indices = jnp.clip(start_idx + jnp.arange(BLOCK_SIZE), 0, means2D_sorted.shape[0] - 1)
-            local_mask = (start_idx + jnp.arange(BLOCK_SIZE)) < (start_idx + count)
+            # Use dynamic_slice instead of gather for contiguous blocks from the sorted arrays
+            means_block = jax.lax.dynamic_slice(means2D_sorted, (start_idx, 0), (BLOCK_SIZE, 2))
+            icov_block = jax.lax.dynamic_slice(inv_cov2D_sorted, (start_idx, 0), (BLOCK_SIZE, 4))
+            ops_block = jax.lax.dynamic_slice(opacities_sorted, (start_idx,), (BLOCK_SIZE,))
+            cols_block = jax.lax.dynamic_slice(colors_sorted, (start_idx, 0), (BLOCK_SIZE, 4))
             
-            return (means2D_sorted[gather_indices], 
-                    inv_cov2D_sorted[gather_indices], 
-                    opacities_sorted[gather_indices, None], 
-                    colors_sorted[gather_indices], 
+            local_mask = jnp.arange(BLOCK_SIZE) < count
+            
+            return (means_block, 
+                    icov_block, 
+                    ops_block[:, None], 
+                    cols_block, 
                     local_mask[:, None].astype(jnp.float32))
 
         # Vectorize over grid
