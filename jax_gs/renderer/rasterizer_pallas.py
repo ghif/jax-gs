@@ -136,35 +136,47 @@ def rasterize_kernel_tpu(
     grid_x = pix_min_x + px
     grid_y = pix_min_y + py
 
-    def scan_body(carry, inputs):
-        accum_color, T = carry
-        mu, icov, op, color, mask = inputs
+    # Load all attribute blocks into standard jax.Arrays once to avoid slow scalar Ref gathers
+    g_means = g_means_ref[...]
+    g_icov = g_icov_ref[...]
+    g_ops = g_ops_ref[...]
+    g_cols = g_cols_ref[...]
+    g_mask = g_mask_ref[...]
+
+    def body_fn(j, state):
+        accum_color, T = state
         
-        dx = grid_x - mu[0]
-        dy = grid_y - mu[1]
+        mu_x = g_means[j, 0]
+        mu_y = g_means[j, 1]
+        icov_00 = g_icov[j, 0]
+        icov_01 = g_icov[j, 1]
+        icov_11 = g_icov[j, 3]
+        op = g_ops[j, 0]
+        mask = g_mask[j, 0]
+
+        dx = grid_x - mu_x
+        dy = grid_y - mu_y
 
         # Compute Gaussian influence
-        power = -0.5 * (dx * dx * icov[0] + dx * dy * 2.0 * icov[1] + dy * dy * icov[3])
-        alpha = jnp.exp(jnp.clip(power, -100.0, 0.0)) * op[0]
+        power = -0.5 * (dx * dx * icov_00 + dx * dy * 2.0 * icov_01 + dy * dy * icov_11)
+        alpha = jnp.exp(jnp.clip(power, -100.0, 0.0)) * op
         
         # Mask inactive or saturated pixels
-        is_active = mask[0] & (power > -10.0) & (grid_x < W) & (grid_y < H) & (T > 1e-4)
+        is_active = mask & (power > -10.0) & (grid_x < W) & (grid_y < H) & (T > 1e-4)
         alpha = jnp.where(is_active, jnp.minimum(0.99, alpha), 0.0)
 
+        # Load color components from VMEM as a vector
+        c = g_cols[j, :]
         weight = alpha * T
         
         # Direct vectorized alpha blending (much faster on TPU)
-        accum_color = accum_color + weight[..., None] * color[None, None, :]
+        accum_color = accum_color + weight[..., None] * c[None, None, :]
         T = T * (1.0 - alpha)
         
-        return (accum_color, T), None
+        return accum_color, T
 
-    # Main loop over pre-gathered Gaussians using scan for optimal XLA pipelining
-    (final_color, final_T), _ = jax.lax.scan(
-        scan_body, 
-        (accum_color, T), 
-        (g_means_ref[...], g_icov_ref[...], g_ops_ref[...], g_cols_ref[...], g_mask_ref[...])
-    )
+    # Main loop over pre-gathered Gaussians using fori_loop on jax.Arrays for high performance
+    final_color, final_T = jax.lax.fori_loop(0, BLOCK_SIZE, body_fn, (accum_color, T))
 
     # Apply background color
     bg = background_ref[...]
