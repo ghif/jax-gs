@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax_gs.renderer.rasterizer import get_tile_interactions, BLOCK_SIZE
 from typing import Tuple, Optional
 from functools import partial
 
@@ -109,23 +110,17 @@ def rasterize_kernel_gpu(
 
 
 def rasterize_kernel_tpu(
-    means2D_T_ref, inv_cov2D_T_ref, opacities_T_ref, colors_T_ref,
-    tile_boundaries_ref, background_ref,
+    g_means_ref, g_icov_ref, g_ops_ref, g_cols_ref, g_mask_ref, background_ref,
     out_grid_ref,
-    *, num_tiles_x, W, H
+    *, W, H
 ):
     """
     Optimized Pallas kernel for TPU (Mosaic).
-    Uses chunked streaming to VMEM and tile-level early termination.
+    Uses pre-gathered attributes for perfectly aligned VMEM access.
     """
     # Grid mapping
     ty = pl.program_id(0)
     tx = pl.program_id(1)
-    tile_idx = ty * num_tiles_x + tx
-    
-    # Dynamic range for this tile
-    start_idx = tile_boundaries_ref[tile_idx]
-    end_idx = tile_boundaries_ref[tile_idx + 1]
     
     pix_min_x = (tx * TILE_SIZE).astype(jnp.float32)
     pix_min_y = (ty * TILE_SIZE).astype(jnp.float32)
@@ -141,71 +136,55 @@ def rasterize_kernel_tpu(
     grid_x = pix_min_x + px
     grid_y = pix_min_y + py
 
-    CHUNK_SIZE = 16
-    num_gaussians = end_idx - start_idx
-    num_chunks = (num_gaussians + CHUNK_SIZE - 1) // CHUNK_SIZE
+    def cond_fn(state):
+        j, _, T = state
+        return (j < BLOCK_SIZE) & (jnp.max(T) >= 1e-4)
 
-    def chunk_body(chunk_idx, state):
-        accum_color, T = state
+    def body_fn(state):
+        j, accum_color, T = state
         
-        def process_chunk(state):
-            accum_color, T = state
-            curr_start = start_idx + chunk_idx * CHUNK_SIZE
-            
-            def gaussian_body(j, state):
-                accum_color, T = state
-                i_global = curr_start + j
-                
-                # Bound check for the last partial chunk
-                mask = i_global < end_idx
-                
-                # Use standard indexing (scalar load) instead of pl.ds on Ref
-                mu_x = means2D_T_ref[0, i_global]
-                mu_y = means2D_T_ref[1, i_global]
-                icov_00 = inv_cov2D_T_ref[0, i_global]
-                icov_01 = inv_cov2D_T_ref[1, i_global]
-                icov_11 = inv_cov2D_T_ref[3, i_global]
-                op = opacities_T_ref[i_global]
+        # Load from VMEM reference (perfectly aligned via BlockSpec)
+        # References are (1, 1, BLOCK_SIZE, ...)
+        mu_x = g_means_ref[0, 0, j, 0]
+        mu_y = g_means_ref[0, 0, j, 1]
+        icov_00 = g_icov_ref[0, 0, j, 0]
+        icov_01 = g_icov_ref[0, 0, j, 1]
+        icov_11 = g_icov_ref[0, 0, j, 3]
+        op = g_ops_ref[0, 0, j]
+        mask = g_mask_ref[0, 0, j]
 
-                dx = grid_x - mu_x
-                dy = grid_y - mu_y
+        dx = grid_x - mu_x
+        dy = grid_y - mu_y
 
-                # Compute Gaussian influence
-                power = -0.5 * (dx * dx * icov_00 + dx * dy * 2.0 * icov_01 + dy * dy * icov_11)
-                alpha = jnp.exp(jnp.clip(power, -100.0, 0.0)) * op
-                
-                # Mask inactive or saturated pixels
-                is_active = mask & (power > -10.0) & (grid_x < W) & (grid_y < H) & (T > 1e-4)
-                alpha = jnp.where(is_active, jnp.minimum(0.99, alpha), 0.0)
+        # Compute Gaussian influence
+        power = -0.5 * (dx * dx * icov_00 + dx * dy * 2.0 * icov_01 + dy * dy * icov_11)
+        alpha = jnp.exp(jnp.clip(power, -100.0, 0.0)) * op
+        
+        # Mask inactive or saturated pixels
+        is_active = mask & (power > -10.0) & (grid_x < W) & (grid_y < H) & (T > 1e-4)
+        alpha = jnp.where(is_active, jnp.minimum(0.99, alpha), 0.0)
 
-                # Load color components element-wise
-                c0 = colors_T_ref[0, i_global]
-                c1 = colors_T_ref[1, i_global]
-                c2 = colors_T_ref[2, i_global]
-                c3 = colors_T_ref[3, i_global]
-                
-                weight = alpha * T
-                
-                # Vectorized alpha blending
-                indices = jnp.arange(4)
-                accum_color = accum_color + (weight[..., None] * c0) * (indices == 0).astype(jnp.float32)
-                accum_color = accum_color + (weight[..., None] * c1) * (indices == 1).astype(jnp.float32)
-                accum_color = accum_color + (weight[..., None] * c2) * (indices == 2).astype(jnp.float32)
-                accum_color = accum_color + (weight[..., None] * c3) * (indices == 3).astype(jnp.float32)
-                
-                T = T * (1.0 - alpha)
-                
-                return accum_color, T
+        # Load color components from VMEM
+        c0 = g_cols_ref[0, 0, j, 0]
+        c1 = g_cols_ref[0, 0, j, 1]
+        c2 = g_cols_ref[0, 0, j, 2]
+        c3 = g_cols_ref[0, 0, j, 3]
+        
+        weight = alpha * T
+        
+        # Vectorized alpha blending
+        indices = jnp.arange(4)
+        accum_color = accum_color + (weight[..., None] * c0) * (indices == 0).astype(jnp.float32)
+        accum_color = accum_color + (weight[..., None] * c1) * (indices == 1).astype(jnp.float32)
+        accum_color = accum_color + (weight[..., None] * c2) * (indices == 2).astype(jnp.float32)
+        accum_color = accum_color + (weight[..., None] * c3) * (indices == 3).astype(jnp.float32)
+        
+        T = T * (1.0 - alpha)
+        
+        return j + 1, accum_color, T
 
-            # Process the chunk of 16 Gaussians
-            accum_color, T = jax.lax.fori_loop(0, CHUNK_SIZE, gaussian_body, (accum_color, T))
-            return jnp.nan_to_num(accum_color), jnp.nan_to_num(T)
-
-        # Tile-level early termination
-        return jax.lax.cond(jnp.max(T) >= 1e-4, process_chunk, lambda s: s, (accum_color, T))
-
-    # Main loop over Gaussian chunks
-    final_color, final_T = jax.lax.fori_loop(0, num_chunks, chunk_body, (accum_color, T))
+    # Main loop over pre-gathered Gaussians with early termination
+    _, final_color, final_T = jax.lax.while_loop(cond_fn, body_fn, (0, accum_color, T))
 
     # Apply background color
     bg = background_ref[...]
@@ -263,22 +242,63 @@ def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sort
     )
 
     is_cpu = jax.devices()[0].platform == "cpu"
-    kernel = rasterize_kernel_gpu if backend == "gpu" else rasterize_kernel_tpu
     
-    # Execute Pallas kernel with 2D grid
-    out_image = pl.pallas_call(
-        partial(kernel, num_tiles_x=num_tiles_x, W=float(W), H=float(H)),
-        out_shape=out_shape,
-        grid=(num_tiles_y, num_tiles_x),
-        out_specs=out_specs,
-        interpret=is_cpu
-    )(
-        means2D_sorted.T, 
-        inv_cov2D_sorted.T, 
-        opacities_sorted, 
-        colors_sorted.T,
-        tile_boundaries, background_padded
-    )
+    if backend == "tpu":
+        # Pre-gather into dense blocks for TPU to avoid unaligned HBM access
+        def get_tile_data(ty, tx):
+            tile_idx = ty * num_tiles_x + tx
+            start_idx = tile_boundaries[tile_idx]
+            end_idx = tile_boundaries[tile_idx + 1]
+            count = end_idx - start_idx
+            
+            gather_indices = jnp.clip(start_idx + jnp.arange(BLOCK_SIZE), 0, means2D_sorted.shape[0] - 1)
+            local_mask = (start_idx + jnp.arange(BLOCK_SIZE)) < (start_idx + count)
+            
+            return (means2D_sorted[gather_indices], 
+                    inv_cov2D_sorted[gather_indices], 
+                    opacities_sorted[gather_indices], 
+                    colors_sorted[gather_indices], 
+                    local_mask)
+
+        # Vectorize over grid
+        grid_y = jnp.arange(num_tiles_y)
+        grid_x = jnp.arange(num_tiles_x)
+        # Nested vmap for 2D grid
+        tile_data_fn = jax.vmap(jax.vmap(get_tile_data, in_axes=(None, 0)), in_axes=(0, None))
+        g_means, g_icov, g_ops, g_cols, g_mask = tile_data_fn(grid_y, grid_x)
+
+        in_specs = [
+            pl.BlockSpec((1, 1, BLOCK_SIZE, 2), lambda ty, tx: (ty, tx, 0, 0)),
+            pl.BlockSpec((1, 1, BLOCK_SIZE, 4), lambda ty, tx: (ty, tx, 0, 0)),
+            pl.BlockSpec((1, 1, BLOCK_SIZE), lambda ty, tx: (ty, tx, 0)),
+            pl.BlockSpec((1, 1, BLOCK_SIZE, 4), lambda ty, tx: (ty, tx, 0, 0)),
+            pl.BlockSpec((1, 1, BLOCK_SIZE), lambda ty, tx: (ty, tx, 0)),
+            pl.BlockSpec(memory_space=pl.ANY) # background
+        ]
+
+        out_image = pl.pallas_call(
+            partial(rasterize_kernel_tpu, W=float(W), H=float(H)),
+            out_shape=out_shape,
+            grid=(num_tiles_y, num_tiles_x),
+            in_specs=in_specs,
+            out_specs=out_specs,
+            interpret=is_cpu
+        )(g_means, g_icov, g_ops, g_cols, g_mask, background_padded)
+    else:
+        # GPU path: uses dynamic indexing directly from HBM (allowed in Triton)
+        out_image = pl.pallas_call(
+            partial(rasterize_kernel_gpu, num_tiles_x=num_tiles_x, W=float(W), H=float(H)),
+            out_shape=out_shape,
+            grid=(num_tiles_y, num_tiles_x),
+            out_specs=out_specs,
+            interpret=is_cpu
+        )(
+            means2D_sorted.T, 
+            inv_cov2D_sorted.T, 
+            opacities_sorted, 
+            colors_sorted.T,
+            tile_boundaries, background_padded
+        )
     
     # Crop to actual image size and drop the 4th channel
     return jnp.nan_to_num(out_image[:H, :W, :3])
