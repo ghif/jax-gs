@@ -273,7 +273,7 @@ def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sort
             pl.BlockSpec((None, None, BLOCK_SIZE, 1), lambda ty, tx: (ty, tx, 0, 0)),
             pl.BlockSpec((None, None, BLOCK_SIZE, 4), lambda ty, tx: (ty, tx, 0, 0)),
             pl.BlockSpec((None, None, BLOCK_SIZE, 1), lambda ty, tx: (ty, tx, 0, 0)),
-            pl.BlockSpec(memory_space=pl.ANY) # background
+            pl.BlockSpec() # background
         ]
 
         out_image = pl.pallas_call(
