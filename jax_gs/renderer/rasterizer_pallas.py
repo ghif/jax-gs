@@ -125,12 +125,12 @@ def rasterize_kernel_tpu(
     pix_min_x = (tx * TILE_SIZE).astype(jnp.float32)
     pix_min_y = (ty * TILE_SIZE).astype(jnp.float32)
     
-    # Pre-generate pixel grid coordinates for this tile, flattened for TPU efficiency
-    py, px = jnp.meshgrid(jnp.arange(TILE_SIZE, dtype=jnp.int32).astype(jnp.float32), 
-                          jnp.arange(TILE_SIZE, dtype=jnp.int32).astype(jnp.float32), 
-                          indexing='ij')
-    grid_x = (pix_min_x + px).flatten() # Shape (256,)
-    grid_y = (pix_min_y + py).flatten() # Shape (256,)
+    # Pre-generate pixel grid coordinates for this tile directly as 1D vectors to avoid unsupported reshape
+    flat_idx = jnp.arange(TILE_SIZE * TILE_SIZE, dtype=jnp.int32)
+    py = (flat_idx // TILE_SIZE).astype(jnp.float32)
+    px = (flat_idx % TILE_SIZE).astype(jnp.float32)
+    grid_x = pix_min_x + px
+    grid_y = pix_min_y + py
 
     # Initialize accumulators as 1D vectors to perfectly fill TPU registers (8x128)
     c0_accum = jnp.zeros((256,), dtype=jnp.float32)
