@@ -34,8 +34,8 @@ def rasterize_kernel_gpu(
     T = jnp.ones((TILE_SIZE, TILE_SIZE), dtype=jnp.float32)
     
     # Pre-generate pixel grid coordinates for this tile
-    py, px = jnp.meshgrid(jnp.arange(TILE_SIZE, dtype=jnp.float32), 
-                          jnp.arange(TILE_SIZE, dtype=jnp.float32), 
+    py, px = jnp.meshgrid(jnp.arange(TILE_SIZE, dtype=jnp.int32).astype(jnp.float32), 
+                          jnp.arange(TILE_SIZE, dtype=jnp.int32).astype(jnp.float32), 
                           indexing='ij')
     grid_x = pix_min_x + px
     grid_y = pix_min_y + py
@@ -135,8 +135,8 @@ def rasterize_kernel_tpu(
     T = jnp.ones((TILE_SIZE, TILE_SIZE), dtype=jnp.float32)
     
     # Pre-generate pixel grid coordinates for this tile
-    py, px = jnp.meshgrid(jnp.arange(TILE_SIZE, dtype=jnp.float32), 
-                          jnp.arange(TILE_SIZE, dtype=jnp.float32), 
+    py, px = jnp.meshgrid(jnp.arange(TILE_SIZE, dtype=jnp.int32).astype(jnp.float32), 
+                          jnp.arange(TILE_SIZE, dtype=jnp.int32).astype(jnp.float32), 
                           indexing='ij')
     grid_x = pix_min_x + px
     grid_y = pix_min_y + py
