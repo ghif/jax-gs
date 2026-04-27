@@ -139,8 +139,9 @@ def rasterize_kernel_tpu(
     # Load packed attribute block into VMEM once to avoid slow scalar Ref gathers
     packed_data = g_packed_ref[...]
 
-    def scan_body(carry, packed_val):
-        accum_color, T = carry
+    for j in range(BLOCK_SIZE):
+        # Static slice (Python integer j) is much faster on TPU than dynamic pl.ds
+        packed_val = packed_data[j]
         
         # Unpack the 12-channel vector
         # [mu_x, mu_y, icov_00, icov_01, icov_10, icov_11, op, c0, c1, c2, c3, mask]
@@ -169,18 +170,13 @@ def rasterize_kernel_tpu(
         # Direct vectorized alpha blending (much faster on TPU)
         accum_color = accum_color + weight[..., None] * c[None, None, :]
         T = T * (1.0 - alpha)
-        
-        return (accum_color, T), None
-
-    # Main loop over pre-gathered Gaussians using scan for optimal XLA pipelining
-    (final_color, final_T), _ = jax.lax.scan(scan_body, (accum_color, T), packed_data)
 
     # Apply background color
     bg = background_ref[...]
-    final_color = final_color + final_T[..., None] * bg[None, None, :]
+    accum_color = accum_color + T[..., None] * bg[None, None, :]
 
     # Store result back to HBM
-    out_grid_ref[...] = jnp.nan_to_num(final_color)
+    out_grid_ref[...] = jnp.nan_to_num(accum_color)
 
 
 def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaussian_ids, 
