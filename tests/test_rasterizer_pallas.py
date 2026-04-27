@@ -36,26 +36,32 @@ def test_pallas_render_parity():
     image_std = render(gaussians, cam, use_pallas=False)
     
     # 3. Render with Pallas renderer (interpret mode on CPU)
-    image_pallas = render(gaussians, cam, use_pallas=True)
+    print("Testing Pallas GPU backend...")
+    image_pallas_gpu = render(gaussians, cam, use_pallas=True, backend="gpu")
+    
+    print("Testing Pallas TPU backend...")
+    image_pallas_tpu = render(gaussians, cam, use_pallas=True, backend="tpu")
     
     # 4. Compare
-    diff = jnp.abs(image_std - image_pallas)
-    max_diff = jnp.max(jnp.nan_to_num(diff))
-    print(f"Max difference: {max_diff}")
-    
-    has_nan_std = jnp.any(jnp.isnan(image_std))
-    has_nan_pallas = jnp.any(jnp.isnan(image_pallas))
-    print(f"Standard has NaNs: {has_nan_std}")
-    print(f"Pallas has NaNs: {has_nan_pallas}")
+    for name, image_pallas in [("GPU", image_pallas_gpu), ("TPU", image_pallas_tpu)]:
+        diff = jnp.abs(image_std - image_pallas)
+        max_diff = jnp.max(jnp.nan_to_num(diff))
+        print(f"[{name}] Max difference: {max_diff}")
+        
+        has_nan_std = jnp.any(jnp.isnan(image_std))
+        has_nan_pallas = jnp.any(jnp.isnan(image_pallas))
+        print(f"[{name}] Standard has NaNs: {has_nan_std}")
+        print(f"[{name}] Pallas has NaNs: {has_nan_pallas}")
 
-    if has_nan_pallas:
-        nan_mask = jnp.isnan(image_pallas)
-        print(f"NaN count in Pallas: {jnp.sum(nan_mask)}")
-        # Handle environment NaNs by assuming 0 for parity check
-        image_pallas = jnp.nan_to_num(image_pallas)
+        if has_nan_pallas:
+            nan_mask = jnp.isnan(image_pallas)
+            print(f"[{name}] NaN count in Pallas: {jnp.sum(nan_mask)}")
+            # Handle environment NaNs by assuming 0 for parity check
+            image_pallas = jnp.nan_to_num(image_pallas)
 
-    np.testing.assert_allclose(image_std, image_pallas, atol=1e-2)
+        np.testing.assert_allclose(image_std, image_pallas, atol=1e-2)
     
+    print("Pallas parity tests (GPU & TPU) passed!")    
     print("Pallas parity test passed!")
 
 if __name__ == "__main__":

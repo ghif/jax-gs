@@ -25,7 +25,8 @@ except ImportError:
     HAS_TORCH = False
 
 def render(gaussians: Gaussians, camera: Camera, background=jnp.array([0.0, 0.0, 0.0]), 
-           use_mlx: bool = False, use_torch: bool = False, use_pallas: bool = False):
+           use_mlx: bool = False, use_torch: bool = False, use_pallas: bool = False,
+           backend: str = "gpu"):
     """
     Main entry point for rendering.
 
@@ -33,6 +34,10 @@ def render(gaussians: Gaussians, camera: Camera, background=jnp.array([0.0, 0.0,
         gaussians: Gaussians dataclass
         camera: Camera dataclass
         background: Background color
+        use_mlx: Use MLX backend
+        use_torch: Use Torch backend
+        use_pallas: Use Pallas backend
+        backend: Accelerator backend for Pallas (gpu or tpu)
     Returns:
         image: Rendered image
     """
@@ -109,7 +114,8 @@ def render(gaussians: Gaussians, camera: Camera, background=jnp.array([0.0, 0.0,
             image = render_tiles_pallas(
                 means2D, cov2D, gaussians.opacities, colors,
                 sorted_tile_ids, sorted_gaussian_ids,
-                camera.H, camera.W, TILE_SIZE, background
+                camera.H, camera.W, TILE_SIZE, background,
+                backend=backend
             )
         else:
             # 4. Rasterize tiles using pure JAX

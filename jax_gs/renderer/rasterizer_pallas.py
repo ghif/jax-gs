@@ -1,12 +1,12 @@
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from typing import Tuple
+from typing import Tuple, Optional
 from functools import partial
 
 TILE_SIZE = 16
 
-def rasterize_kernel(
+def rasterize_kernel_gpu(
     means2D_T_ref, inv_cov2D_T_ref, opacities_T_ref, colors_T_ref,
     tile_boundaries_ref, background_ref,
     out_grid_ref,
@@ -73,11 +73,9 @@ def rasterize_kernel(
         
         # Alpha blending: Update each channel separately to avoid concatenate/stack primitives
         # Triton lowering has limitations on concatenate/stack of non-singleton dimensions.
-        # accum_color is (TILE_SIZE, TILE_SIZE, 4), weight is (TILE_SIZE, TILE_SIZE)
         weight = alpha * T
         
         # Use broadcasting to update the 4th dimension without explicit vector construction
-        # (TILE_SIZE, TILE_SIZE, 1) * (4,) where (4,) is a one-hot mask
         indices = jnp.arange(4)
         accum_color = accum_color + (weight[..., None] * c0) * (indices == 0).astype(jnp.float32)
         accum_color = accum_color + (weight[..., None] * c1) * (indices == 1).astype(jnp.float32)
@@ -109,10 +107,113 @@ def rasterize_kernel(
     out_grid_ref[...] = jnp.nan_to_num(final_color)
 
 
-def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaussian_ids, 
-                        H, W, tile_size: int = TILE_SIZE, background=jnp.array([0.0, 0.0, 0.0])):
+def rasterize_kernel_tpu(
+    means2D_T_ref, inv_cov2D_T_ref, opacities_T_ref, colors_T_ref,
+    tile_boundaries_ref, background_ref,
+    out_grid_ref,
+    *, num_tiles_x, W, H
+):
     """
-    Render tiles using JAX Pallas, optimized for GPU.
+    Optimized Pallas kernel for TPU (Mosaic).
+    Uses chunked streaming to VMEM and tile-level early termination.
+    """
+    # Grid mapping
+    ty = pl.program_id(0)
+    tx = pl.program_id(1)
+    tile_idx = ty * num_tiles_x + tx
+    
+    # Dynamic range for this tile
+    start_idx = tile_boundaries_ref[tile_idx]
+    end_idx = tile_boundaries_ref[tile_idx + 1]
+    
+    pix_min_x = (tx * TILE_SIZE).astype(jnp.float32)
+    pix_min_y = (ty * TILE_SIZE).astype(jnp.float32)
+    
+    # Initialize accumulators in VMEM
+    accum_color = jnp.zeros((TILE_SIZE, TILE_SIZE, 4), dtype=jnp.float32)
+    T = jnp.ones((TILE_SIZE, TILE_SIZE), dtype=jnp.float32)
+    
+    # Pre-generate pixel grid coordinates for this tile
+    py, px = jnp.meshgrid(jnp.arange(TILE_SIZE, dtype=jnp.float32), 
+                          jnp.arange(TILE_SIZE, dtype=jnp.float32), 
+                          indexing='ij')
+    grid_x = pix_min_x + px
+    grid_y = pix_min_y + py
+
+    CHUNK_SIZE = 16
+    num_gaussians = end_idx - start_idx
+    num_chunks = (num_gaussians + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+    def chunk_body(chunk_idx, state):
+        accum_color, T = state
+        
+        def process_chunk(state):
+            accum_color, T = state
+            curr_start = start_idx + chunk_idx * CHUNK_SIZE
+            
+            # Load chunks of Gaussian attributes into VMEM using pl.load and dynamic slicing (pl.ds)
+            m2d_chunk = pl.load(means2D_T_ref, (slice(None), pl.ds(curr_start, CHUNK_SIZE)))
+            icov_chunk = pl.load(inv_cov2D_T_ref, (slice(None), pl.ds(curr_start, CHUNK_SIZE)))
+            op_chunk = pl.load(opacities_T_ref, (pl.ds(curr_start, CHUNK_SIZE),))
+            col_chunk = pl.load(colors_T_ref, (slice(None), pl.ds(curr_start, CHUNK_SIZE)))
+
+            def gaussian_body(j, state):
+                accum_color, T = state
+                i_global = curr_start + j
+                
+                # Bound check for the last partial chunk
+                mask = i_global < end_idx
+                
+                mu_x = m2d_chunk[0, j]
+                mu_y = m2d_chunk[1, j]
+                icov_00 = icov_chunk[0, j]
+                icov_01 = icov_chunk[1, j]
+                icov_11 = icov_chunk[3, j]
+                op = op_chunk[j]
+
+                dx = grid_x - mu_x
+                dy = grid_y - mu_y
+
+                # Compute Gaussian influence
+                power = -0.5 * (dx * dx * icov_00 + dx * dy * 2.0 * icov_01 + dy * dy * icov_11)
+                alpha = jnp.exp(jnp.clip(power, -100.0, 0.0)) * op
+                
+                # Mask inactive or saturated pixels
+                is_active = mask & (power > -10.0) & (grid_x < W) & (grid_y < H) & (T > 1e-4)
+                alpha = jnp.where(is_active, jnp.minimum(0.99, alpha), 0.0)
+
+                c = col_chunk[:, j]
+                weight = alpha * T
+                
+                # Vectorized alpha blending
+                new_accum_color = accum_color + weight[..., None] * c[None, None, :]
+                new_T = T * (1.0 - alpha)
+                
+                return new_accum_color, new_T
+
+            # Process the chunk of 16 Gaussians
+            accum_color, T = jax.lax.fori_loop(0, CHUNK_SIZE, gaussian_body, (accum_color, T))
+            return jnp.nan_to_num(accum_color), jnp.nan_to_num(T)
+
+        # Tile-level early termination
+        return jax.lax.cond(jnp.max(T) >= 1e-4, process_chunk, lambda s: s, (accum_color, T))
+
+    # Main loop over Gaussian chunks
+    final_color, final_T = jax.lax.fori_loop(0, num_chunks, chunk_body, (accum_color, T))
+
+    # Apply background color
+    bg = background_ref[...]
+    final_color = final_color + final_T[..., None] * bg[None, None, :]
+
+    # Store result back to HBM
+    out_grid_ref[...] = jnp.nan_to_num(final_color)
+
+
+def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaussian_ids, 
+                        H, W, tile_size: int = TILE_SIZE, background=jnp.array([0.0, 0.0, 0.0]),
+                        backend: str = "gpu"):
+    """
+    Render tiles using JAX Pallas, compatible with both GPU and TPU.
     """
     assert tile_size == TILE_SIZE
     
@@ -156,10 +257,11 @@ def render_tiles_pallas(means2D, cov2D, opacities, colors, sorted_tile_ids, sort
     )
 
     is_cpu = jax.devices()[0].platform == "cpu"
+    kernel = rasterize_kernel_gpu if backend == "gpu" else rasterize_kernel_tpu
     
     # Execute Pallas kernel with 2D grid
     out_image = pl.pallas_call(
-        partial(rasterize_kernel, num_tiles_x=num_tiles_x, W=float(W), H=float(H)),
+        partial(kernel, num_tiles_x=num_tiles_x, W=float(W), H=float(H)),
         out_shape=out_shape,
         grid=(num_tiles_y, num_tiles_x),
         out_specs=out_specs,

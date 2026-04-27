@@ -7,7 +7,7 @@ from jax_gs.core.gaussians import init_gaussians_from_pcd
 from jax_gs.core.camera import Camera
 from jax_gs.renderer.renderer import render
 
-def test_benchmark_renderer(use_pallas=False):
+def test_benchmark_renderer(use_pallas=False, backend="gpu"):
     """
     Benchmark the JAX renderer performance.
     """
@@ -15,6 +15,8 @@ def test_benchmark_renderer(use_pallas=False):
     print(f"JAX Version: {jax.__version__}")
     print(f"JAX Devices: {jax.devices()}")
     print(f"Using Pallas: {use_pallas}")
+    if use_pallas:
+        print(f"Pallas Backend: {backend}")
 
     # 1. Setup Data (Scale of Fern Dataset @ 1/8 res)
     num_points = 150_000
@@ -48,7 +50,7 @@ def test_benchmark_renderer(use_pallas=False):
             W2C=W2C,
             full_proj=full_proj
         )
-        return render(gaussians, curr_cam, use_pallas=use_pallas)
+        return render(gaussians, curr_cam, use_pallas=use_pallas, backend=backend)
     
     # JIT Warm-up
     print("Warming up (JIT)...")
@@ -93,7 +95,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark JAX Gaussian Splatting renderer.")
     parser.add_argument("--pallas", type=str2bool, nargs='?', const=True, default=False, 
                         help="Use Pallas renderer (True/False or just --pallas for True).")
+    parser.add_argument("--backend", type=str, default="gpu", choices=["gpu", "tpu"],
+                        help="Backend for Pallas (gpu or tpu).")
     args = parser.parse_args()
 
     # If running directly, execute the benchmark
-    test_benchmark_renderer(use_pallas=args.pallas)
+    test_benchmark_renderer(use_pallas=args.pallas, backend=args.backend)
