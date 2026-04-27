@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 from typing import Tuple, Optional
 from functools import partial
 
@@ -151,11 +152,11 @@ def rasterize_kernel_tpu(
             accum_color, T = state
             curr_start = start_idx + chunk_idx * CHUNK_SIZE
             
-            # Load chunks of Gaussian attributes into VMEM using pl.load and dynamic slicing (pl.ds)
-            m2d_chunk = pl.load(means2D_T_ref, (slice(None), pl.ds(curr_start, CHUNK_SIZE)))
-            icov_chunk = pl.load(inv_cov2D_T_ref, (slice(None), pl.ds(curr_start, CHUNK_SIZE)))
-            op_chunk = pl.load(opacities_T_ref, (pl.ds(curr_start, CHUNK_SIZE),))
-            col_chunk = pl.load(colors_T_ref, (slice(None), pl.ds(curr_start, CHUNK_SIZE)))
+            # Load chunks of Gaussian attributes into VMEM using dynamic slicing (pl.ds)
+            m2d_chunk = means2D_T_ref[slice(None), pl.ds(curr_start, CHUNK_SIZE)]
+            icov_chunk = inv_cov2D_T_ref[slice(None), pl.ds(curr_start, CHUNK_SIZE)]
+            op_chunk = opacities_T_ref[pl.ds(curr_start, CHUNK_SIZE)]
+            col_chunk = colors_T_ref[slice(None), pl.ds(curr_start, CHUNK_SIZE)]
 
             def gaussian_body(j, state):
                 accum_color, T = state
