@@ -136,23 +136,17 @@ def rasterize_kernel_tpu(
     grid_x = pix_min_x + px
     grid_y = pix_min_y + py
 
-    # Load all attribute blocks into standard jax.Arrays once to avoid slow scalar Ref gathers
-    g_means = g_means_ref[...]
-    g_icov = g_icov_ref[...]
-    g_ops = g_ops_ref[...]
-    g_cols = g_cols_ref[...]
-    g_mask = g_mask_ref[...]
-
     def body_fn(j, state):
         accum_color, T = state
         
-        mu_x = g_means[j, 0]
-        mu_y = g_means[j, 1]
-        icov_00 = g_icov[j, 0]
-        icov_01 = g_icov[j, 1]
-        icov_11 = g_icov[j, 3]
-        op = g_ops[j, 0]
-        mask = g_mask[j, 0]
+        # Load from VMEM reference using pl.ds for dynamic slicing (Mosaic requirement)
+        mu_x = g_means_ref[pl.ds(j, 1), 0][0]
+        mu_y = g_means_ref[pl.ds(j, 1), 1][0]
+        icov_00 = g_icov_ref[pl.ds(j, 1), 0][0]
+        icov_01 = g_icov_ref[pl.ds(j, 1), 1][0]
+        icov_11 = g_icov_ref[pl.ds(j, 1), 3][0]
+        op = g_ops_ref[pl.ds(j, 1), 0][0]
+        mask = g_mask_ref[pl.ds(j, 1), 0][0]
 
         dx = grid_x - mu_x
         dy = grid_y - mu_y
@@ -165,8 +159,8 @@ def rasterize_kernel_tpu(
         is_active = mask & (power > -10.0) & (grid_x < W) & (grid_y < H) & (T > 1e-4)
         alpha = jnp.where(is_active, jnp.minimum(0.99, alpha), 0.0)
 
-        # Load color components from VMEM as a vector
-        c = g_cols[j, :]
+        # Load color components from VMEM as a vector slice
+        c = g_cols_ref[pl.ds(j, 1), :][0]
         weight = alpha * T
         
         # Direct vectorized alpha blending (much faster on TPU)
@@ -175,7 +169,7 @@ def rasterize_kernel_tpu(
         
         return accum_color, T
 
-    # Main loop over pre-gathered Gaussians using fori_loop on jax.Arrays for high performance
+    # Main loop over pre-gathered Gaussians (Fixed loop for better TPU pipelining)
     final_color, final_T = jax.lax.fori_loop(0, BLOCK_SIZE, body_fn, (accum_color, T))
 
     # Apply background color
