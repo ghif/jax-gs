@@ -16,6 +16,7 @@ from jax_gs.io.colmap import load_colmap_dataset
 from jax_gs.io.ply import save_ply
 from jax_gs.training.trainer import train_step
 from jax_gs.core.camera import Camera
+from jax_gs.training.losses import l1_loss, d_ssim_loss
 
 def run_training_tpu(num_iterations: int = 10000):
     # 0. TPU Init
@@ -50,7 +51,7 @@ def run_training_tpu(num_iterations: int = 10000):
         
         lambda_ssim = 0.2
         def loss_fn(p):
-            image = render(p, camera)
+            image, _ = render(p, camera)
             l1 = l1_loss(image, target_image)
             d_ssim = d_ssim_loss(image, target_image)
             return (1.0 - lambda_ssim) * l1 + lambda_ssim * d_ssim
@@ -79,9 +80,6 @@ def run_training_tpu(num_iterations: int = 10000):
     params = replicated_gaussians
     opt_state = replicated_opt_state
 
-    # Static imports for the loss functions
-    from jax_gs.training.losses import l1_loss, d_ssim_loss
-
     for i in pbar:
         # Pick random cameras for each device
         idxs = [random.randint(0, len(jax_cameras)-1) for _ in range(num_devices)]
@@ -101,7 +99,7 @@ def run_training_tpu(num_iterations: int = 10000):
             if i % 100 == 0:
                 # Get params from device 0 for rendering
                 single_gaussians = jax.tree_map(lambda x: x[0], params)
-                img = render(single_gaussians, jax_cameras[0])
+                img, _ = render(single_gaussians, jax_cameras[0])
                 img_np = np.array(img)
                 Image.fromarray((np.clip(img_np, 0, 1) * 255).astype(np.uint8)).save(
                     os.path.join(progress_dir, f"progress_{i*num_devices:04d}.png")

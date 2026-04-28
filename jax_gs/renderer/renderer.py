@@ -1,8 +1,11 @@
 import jax.numpy as jnp
 from jax_gs.core.gaussians import Gaussians
+from jax_gs.core.gaussians_2d import Gaussians2D
 from jax_gs.core.camera import Camera
 from jax_gs.renderer.projection import project_gaussians
+from jax_gs.renderer.projection_2d import project_gaussians_2d
 from jax_gs.renderer.rasterizer import get_tile_interactions, render_tiles, TILE_SIZE
+from jax_gs.renderer.rasterizer_2d import render_tiles_2d
 
 try:
     from jax_gs.renderer.rasterizer_pallas import render_tiles_pallas
@@ -24,23 +27,52 @@ try:
 except ImportError:
     HAS_TORCH = False
 
-def render(gaussians: Gaussians, camera: Camera, background=jnp.array([0.0, 0.0, 0.0]), 
+def render(gaussians, camera: Camera, background=jnp.array([0.0, 0.0, 0.0]), 
            use_mlx: bool = False, use_torch: bool = False, use_pallas: bool = False,
-           backend: str = "gpu"):
+           backend: str = "gpu", mode: str = "3dgs"):
     """
     Main entry point for rendering.
 
     Args:
-        gaussians: Gaussians dataclass
+        gaussians: Gaussians or Gaussians2D dataclass
         camera: Camera dataclass
         background: Background color
         use_mlx: Use MLX backend
         use_torch: Use Torch backend
         use_pallas: Use Pallas backend
         backend: Accelerator backend for Pallas (gpu or tpu)
+        mode: Rendering mode ('3dgs' or '2dgs')
     Returns:
         image: Rendered image
+        extras: Optional dictionary with auxiliary maps (depth, normals, etc.)
     """
+    if mode == "2dgs":
+        # 1. Project 2D Gaussians
+        means2D, cov2D, radii, valid_mask, depths, normals = project_gaussians_2d(gaussians, camera)
+        
+        colors = gaussians.sh_coeffs[:, 0, :] * 0.28209479177387814 + 0.5
+        colors = jnp.clip(colors, 0.0, 1.0)
+        
+        # 2. Sort interactions
+        sorted_tile_ids, sorted_gaussian_ids, n_interactions = get_tile_interactions(
+            means2D, radii, valid_mask, depths, camera.H, camera.W, TILE_SIZE
+        )
+        
+        # 3. Rasterize tiles (JAX only for now for 2DGS)
+        image, depth, depth_sq, normal_map = render_tiles_2d(
+            means2D, cov2D, gaussians.opacities, colors, depths, normals,
+            sorted_tile_ids, sorted_gaussian_ids,
+            camera.H, camera.W, TILE_SIZE, background
+        )
+        
+        extras = {
+            "depth": depth,
+            "depth_sq": depth_sq,
+            "normals": normal_map
+        }
+        return image, extras
+
+    # --- 3DGS Pipeline ---
     # 1. Project Gaussians to 2D
     means2D, cov2D, radii, valid_mask, depths = project_gaussians(gaussians, camera)
     
@@ -79,6 +111,7 @@ def render(gaussians: Gaussians, camera: Camera, background=jnp.array([0.0, 0.0,
         
         # Convert back to JAX
         image = jnp.array(np.array(image_mlx))
+        return image, {}
     elif use_torch and HAS_TORCH:
         # Convert JAX to Torch
         import numpy as np
@@ -103,6 +136,7 @@ def render(gaussians: Gaussians, camera: Camera, background=jnp.array([0.0, 0.0,
         
         # Convert back to JAX
         image = jnp.array(image_torch.cpu().numpy())
+        return image, {}
     else:
         # 3. Sort interactions
         sorted_tile_ids, sorted_gaussian_ids, n_interactions = get_tile_interactions(
@@ -124,5 +158,4 @@ def render(gaussians: Gaussians, camera: Camera, background=jnp.array([0.0, 0.0,
                 sorted_tile_ids, sorted_gaussian_ids,
                 camera.H, camera.W, TILE_SIZE, background
             )
-    
-    return image
+        return image, {}

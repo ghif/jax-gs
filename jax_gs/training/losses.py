@@ -65,3 +65,57 @@ def d_ssim_loss(pred, target):
     Structural Dissimilarity loss.
     """
     return jnp.maximum(0, (1.0 - ssim(pred, target)) / 2.0)
+
+def depth_distortion_loss(depth, depth_sq):
+    """
+    Computes a simplified depth distortion loss using depth variance.
+    This encourages splats along a ray to concentrate at a single depth.
+
+    Args:
+        depth: (H, W, 1) Rendered depth map
+        depth_sq: (H, W, 1) Rendered depth squared map
+    Returns:
+        loss: Scalar loss value
+    """
+    # Variance = E[d^2] - (E[d])^2
+    # For a single ray, this is proportional to the distortion loss
+    variance = jnp.maximum(depth_sq - depth**2, 0.0)
+    return jnp.mean(variance)
+
+def normal_consistency_loss(rendered_normals, depth_map, camera):
+    """
+    Computes normal consistency loss between rendered normals and 
+    normals derived from the depth map gradient.
+
+    Args:
+        rendered_normals: (H, W, 3) Accumulated normal map
+        depth_map: (H, W, 1) Accumulated depth map
+        camera: Camera object for intrinsics
+    Returns:
+        loss: Scalar loss value
+    """
+    # 1. Compute surface normal from depth map gradient
+    # Normalize depth map for gradient calculation
+    H, W = depth_map.shape[:2]
+
+    # Simple central difference for gradients
+    dz_dx = (jnp.roll(depth_map, -1, axis=1) - jnp.roll(depth_map, 1, axis=1)) / 2.0
+    dz_dy = (jnp.roll(depth_map, -1, axis=0) - jnp.roll(depth_map, 1, axis=0)) / 2.0
+
+    # Backproject pixels to 3D to get surface normals
+    # For a pinhole camera: N = normalize([-dz/dx * f/x, -dz/dy * f/y, 1])
+    # Simplified version in camera space:
+    nx = -dz_dx
+    ny = -dz_dy
+    nz = jnp.ones_like(depth_map)
+
+    n_depth = jnp.concatenate([nx, ny, nz], axis=-1)
+    n_depth = n_depth / jnp.linalg.norm(n_depth, axis=-1, keepdims=True)
+
+    # 2. Compute consistency with rendered normals
+    # rendered_normals should already be normalized or we normalize here
+    n_rendered = rendered_normals / jnp.maximum(jnp.linalg.norm(rendered_normals, axis=-1, keepdims=True), 1e-6)
+
+    # Loss is 1 - cosine similarity
+    cos_sim = jnp.sum(n_rendered * n_depth, axis=-1)
+    return jnp.mean(1.0 - cos_sim)
