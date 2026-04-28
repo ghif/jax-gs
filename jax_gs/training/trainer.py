@@ -28,24 +28,24 @@ def train_step(state, target_image, w2c, camera_static, optimizer, use_pallas=Fa
     camera = Camera(W=W, H=H, fx=fx, fy=fy, cx=cx, cy=cy, W2C=w2c, full_proj=jnp.eye(4))
     
     lambda_ssim = 0.2
-    lambda_distortion = 0.001
-    lambda_normal = 0.01 # Adjusted for stability
-    
+    lambda_distortion = 0.0001
+    lambda_normal = 0.0001
+
     def loss_fn(p):
         image, extras = render(p, camera, use_pallas=use_pallas, mode=mode, backend=backend)
         l1 = l1_loss(image, target_image)
         d_ssim = d_ssim_loss(image, target_image)
-        
+
         total_loss = (1.0 - lambda_ssim) * l1 + lambda_ssim * d_ssim
-        
+
         metrics = {
             "l1": l1,
             "ssim": 1.0 - d_ssim * 2.0
         }
-        
+
         if mode == "2dgs":
-            # Re-enable all regularization losses with stable implementations
-            l_dist = depth_distortion_loss(extras["depth"], extras["depth_sq"])
+            # Pass accum_weight to the stabilized loss functions
+            l_dist = depth_distortion_loss(extras["depth"], extras["depth_sq"], extras["accum_weight"])
             l_normal = normal_consistency_loss(extras["normals"], extras["depth"], camera)
 
             total_loss = total_loss + lambda_distortion * l_dist + lambda_normal * l_normal

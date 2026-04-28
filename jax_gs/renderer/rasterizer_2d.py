@@ -7,27 +7,7 @@ def render_tiles_2d(means2D, cov2D, opacities, colors, depths, normals, sorted_t
                     H, W, tile_size: int = TILE_SIZE, background=jnp.array([0.0, 0.0, 0.0])):
     """
     Render the tiles for 2DGS. Outputs color, depth, and normal maps.
-
-    Args:
-        means2D: 2D means of the projected splats
-        cov2D: 2D covariance of the projected splats
-        opacities: Opacities of the projected splats
-        colors: Colors of the projected splats
-        depths: Depths of the projected splats
-        normals: Normals of the projected splats (in camera space)
-        sorted_tile_ids: Sorted tile IDs
-        sorted_gaussian_ids: Sorted Gaussian IDs
-        H: Image height
-        W: Image width
-        tile_size: Tile size
-        background: Background color
-    Returns:
-        image: Rendered image (H, W, 3)
-        depth_map: Rendered depth map (H, W, 1)
-        depth_sq_map: Rendered depth squared map (H, W, 1) - for distortion loss
-        normal_map: Rendered normal map (H, W, 3)
     """
-    
     num_tiles_x = (W + tile_size - 1) // tile_size
     num_tiles_y = (H + tile_size - 1) // tile_size
     num_tiles = num_tiles_x * num_tiles_y
@@ -39,14 +19,11 @@ def render_tiles_2d(means2D, cov2D, opacities, colors, depths, normals, sorted_t
         jnp.stack([cov2D[:, 1, 1] / det, -cov2D[:, 0, 1] / det], axis=-1),
         jnp.stack([-cov2D[:, 1, 0] / det, cov2D[:, 0, 0] / det], axis=-1)
     ], axis=-2)
-    # Pre-calculate sigmoid opacities
     sig_opacities = jax.nn.sigmoid(opacities)
     
-    # Pre-calculate tile boundaries
     tile_indices = jnp.arange(num_tiles + 1)
     tile_boundaries = jnp.searchsorted(sorted_tile_ids, tile_indices)
 
-    # Pre-calculate pixel grid for a single tile
     py, px = jnp.mgrid[0:tile_size, 0:tile_size]
     tile_pixel_x = px.astype(jnp.float32)
     tile_pixel_y = py.astype(jnp.float32)
@@ -59,14 +36,13 @@ def render_tiles_2d(means2D, cov2D, opacities, colors, depths, normals, sorted_t
         gather_indices = jnp.clip(start_idx + jnp.arange(BLOCK_SIZE), 0, sorted_gaussian_ids.shape[0] - 1)
         indices = jnp.take(sorted_gaussian_ids, gather_indices)
         local_mask = (start_idx + jnp.arange(BLOCK_SIZE)) < (start_idx + count)
-        safe_indices = indices
         
-        t_means = means2D[safe_indices]
-        t_inv_cov = inv_cov2D[safe_indices]
-        t_ops = sig_opacities[safe_indices]
-        t_cols = colors[safe_indices]
-        t_depths = depths[safe_indices]
-        t_normals = normals[safe_indices]
+        t_means = means2D[indices]
+        t_inv_cov = inv_cov2D[indices]
+        t_ops = sig_opacities[indices]
+        t_cols = colors[indices]
+        t_depths = depths[indices]
+        t_normals = normals[indices]
         
         ty = tile_idx // num_tiles_x
         tx = tile_idx % num_tiles_x
@@ -78,7 +54,6 @@ def render_tiles_2d(means2D, cov2D, opacities, colors, depths, normals, sorted_t
         pixel_coords = jnp.stack([grid_x, grid_y], axis=-1).reshape(-1, 2)
         pixel_valid = (pixel_coords[:, 0] < W) & (pixel_coords[:, 1] < H)
 
-        # Pre-extract covariance components for expanded math
         t_ic00 = t_inv_cov[:, 0, 0]
         t_ic01_2 = 2.0 * t_inv_cov[:, 0, 1]
         t_ic11 = t_inv_cov[:, 1, 1]
@@ -113,35 +88,40 @@ def render_tiles_2d(means2D, cov2D, opacities, colors, depths, normals, sorted_t
                 )
                 
                 final_color = final_color + final_T * background
-                # We don't add background to depth or normals typically, or we add a far value
-                return jnp.where(p_valid, 
-                                 jnp.concatenate([final_color, 
-                                                  jnp.array([final_depth]), 
-                                                  jnp.array([final_depth_sq]), 
-                                                  final_normal]), 
-                                 jnp.zeros(8))
+                # Return all components as a single array for vmap efficiency
+                res = jnp.concatenate([
+                    final_color,
+                    jnp.array([final_depth, final_depth_sq]),
+                    final_normal,
+                    jnp.array([1.0 - final_T])
+                ])
+                return jnp.where(p_valid, res, jnp.zeros(9))
 
             tile_data = jax.vmap(blend_pixel)(pixel_coords, pixel_valid)
-            return tile_data.reshape(tile_size, tile_size, 8)
+            return tile_data.reshape(tile_size, tile_size, 9)
             
         def empty_tile():
-            # color (3), depth (1), depth_sq (1), normal (3)
-            bg_data = jnp.concatenate([background, jnp.array([0.0, 0.0]), jnp.zeros(3)])
-            return jnp.broadcast_to(bg_data, (tile_size, tile_size, 8))
+            bg = jnp.zeros(9)
+            bg = bg.at[0:3].set(background)
+            return jnp.broadcast_to(bg, (tile_size, tile_size, 9))
 
-        tile_data = jax.lax.cond(count > 0, process_tile, empty_tile)
-        return tile_data
+        return jax.lax.cond(count > 0, process_tile, empty_tile)
 
-    # Rasterize all tiles in parallel
+    # Parallel rasterization
     all_tiles = jax.vmap(rasterize_single_tile)(jnp.arange(num_tiles))
     
-    output_grid = all_tiles.reshape(num_tiles_y, num_tiles_x, tile_size, tile_size, 8)
-    output_data = output_grid.swapaxes(1, 2).reshape(num_tiles_y * tile_size, num_tiles_x * tile_size, 8)
-    output_data = output_data[:H, :W, :]
+    # Reshape and crop
+    def untile(data):
+        # data: (num_tiles, tile_size, tile_size, C)
+        grid = data.reshape(num_tiles_y, num_tiles_x, tile_size, tile_size, -1)
+        grid = grid.swapaxes(1, 2) # (num_tiles_y, tile_size, num_tiles_x, tile_size, C)
+        full = grid.reshape(num_tiles_y * tile_size, num_tiles_x * tile_size, -1)
+        return full[:H, :W, :]
+
+    full_data = untile(all_tiles)
     
-    image = output_data[:, :, 0:3]
-    depth_map = output_data[:, :, 3:4]
-    depth_sq_map = output_data[:, :, 4:5]
-    normal_map = output_data[:, :, 5:8]
-    
-    return image, depth_map, depth_sq_map, normal_map
+    return (full_data[:, :, 0:3], 
+            full_data[:, :, 3:4], 
+            full_data[:, :, 4:5], 
+            full_data[:, :, 5:8], 
+            full_data[:, :, 8:9])

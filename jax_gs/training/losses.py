@@ -66,7 +66,7 @@ def d_ssim_loss(pred, target):
     """
     return jnp.maximum(0, (1.0 - ssim(pred, target)) / 2.0)
 
-def depth_distortion_loss(depth, depth_sq):
+def depth_distortion_loss(depth, depth_sq, accum_weight):
     """
     Computes a simplified depth distortion loss using depth variance.
     This encourages splats along a ray to concentrate at a single depth.
@@ -74,13 +74,28 @@ def depth_distortion_loss(depth, depth_sq):
     Args:
         depth: (H, W, 1) Rendered depth map
         depth_sq: (H, W, 1) Rendered depth squared map
+        accum_weight: (H, W, 1) Accumulated weight map
     Returns:
         loss: Scalar loss value
     """
+    # Use stop_gradient on the weight to avoid pushing opacities to zero
+    w = jax.lax.stop_gradient(accum_weight)
+    
+    # Safe normalization: only normalize where we have significant weight
+    # to avoid numerical instability in the gradient.
+    mask = w > 1e-4
+    safe_w = jnp.where(mask, w, 1.0)
+    
+    # Normalize depth expectations
+    exp_d = jnp.where(mask, depth / safe_w, 0.0)
+    exp_d_sq = jnp.where(mask, depth_sq / safe_w, 0.0)
+    
     # Variance = E[d^2] - (E[d])^2
-    # For a single ray, this is proportional to the distortion loss
-    variance = jnp.maximum(depth_sq - depth**2, 0.0)
-    return jnp.mean(variance)
+    # Ensure it's non-negative for numerical safety
+    variance = jnp.maximum(exp_d_sq - exp_d**2, 0.0)
+    
+    # Weight by accum_weight so empty areas have zero loss
+    return jnp.mean(variance * w)
 
 def normal_consistency_loss(rendered_normals, depth_map, camera):
     """
@@ -95,38 +110,34 @@ def normal_consistency_loss(rendered_normals, depth_map, camera):
         loss: Scalar loss value
     """
     # 1. Compute surface normal from depth map gradient
-    # Normalize depth map for gradient calculation
-    H, W = depth_map.shape[:2]
-
+    # Use stop_gradient on depth_map for the gradient calculation to avoid 
+    # pushing opacities to zero via the depth gradient.
+    d = jax.lax.stop_gradient(depth_map)
+    
     # Simple central difference for gradients
-    dz_dx = (jnp.roll(depth_map, -1, axis=1) - jnp.roll(depth_map, 1, axis=1)) / 2.0
-    dz_dy = (jnp.roll(depth_map, -1, axis=0) - jnp.roll(depth_map, 1, axis=0)) / 2.0
+    dz_dx = (jnp.roll(d, -1, axis=1) - jnp.roll(d, 1, axis=1)) / 2.0
+    dz_dy = (jnp.roll(d, -1, axis=0) - jnp.roll(d, 1, axis=0)) / 2.0
 
-    # Backproject pixels to 3D to get surface normals
-    # For a pinhole camera: N = normalize([-dz/dx * f/x, -dz/dy * f/y, 1])
     # Simplified version in camera space:
     nx = -dz_dx
     ny = -dz_dy
-    nz = jnp.ones_like(depth_map)
+    nz = jnp.ones_like(d)
 
     n_depth = jnp.concatenate([nx, ny, nz], axis=-1)
-    n_depth = n_depth / jnp.linalg.norm(n_depth, axis=-1, keepdims=True)
+    # Safe normalization
+    n_depth_norm = jnp.sqrt(jnp.sum(n_depth**2, axis=-1, keepdims=True) + 1e-6)
+    n_depth = n_depth / n_depth_norm
 
     # 2. Compute consistency with rendered normals
-    # Use a weighted version of the loss to avoid division by zero and exploding gradients.
-    # The weight is the norm of the accumulated normals (related to opacity).
-    rendered_norm = jnp.linalg.norm(rendered_normals, axis=-1, keepdims=True)
+    rendered_norm = jnp.sqrt(jnp.sum(rendered_normals**2, axis=-1, keepdims=True) + 1e-8)
     
-    # Safe unit normal for rendered splats - use 'double where' trick for JAX stability
-    safe_norm = jnp.where(rendered_norm > 1e-6, rendered_norm, 1.0)
-    n_rendered = jnp.where(rendered_norm > 1e-6, rendered_normals / safe_norm, 0.0)
+    # Safe unit normal for rendered splats
+    n_rendered = rendered_normals / rendered_norm
     
     # Cosine similarity
     cos_sim = jnp.sum(n_rendered * n_depth, axis=-1, keepdims=True)
     
     # Weighted loss: (1 - cos_sim) * stop_gradient(rendered_norm)
-    # We stop gradient on the weight so the loss only optimizes normal directions,
-    # not the existence/opacity of the splats themselves.
     loss_map = (1.0 - cos_sim) * jax.lax.stop_gradient(rendered_norm)
     
     return jnp.mean(loss_map)

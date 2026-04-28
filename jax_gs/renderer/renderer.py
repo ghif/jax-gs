@@ -59,7 +59,7 @@ def render(gaussians, camera: Camera, background=jnp.array([0.0, 0.0, 0.0]),
         )
         
         # 3. Rasterize tiles (JAX only for now for 2DGS)
-        image, depth, depth_sq, normal_map = render_tiles_2d(
+        image, depth, depth_sq, normal_map, accum_weight = render_tiles_2d(
             means2D, cov2D, gaussians.opacities, colors, depths, normals,
             sorted_tile_ids, sorted_gaussian_ids,
             camera.H, camera.W, TILE_SIZE, background
@@ -68,7 +68,8 @@ def render(gaussians, camera: Camera, background=jnp.array([0.0, 0.0, 0.0]),
         extras = {
             "depth": depth,
             "depth_sq": depth_sq,
-            "normals": normal_map
+            "normals": normal_map,
+            "accum_weight": accum_weight
         }
         return image, extras
 
