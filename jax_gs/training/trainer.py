@@ -29,7 +29,7 @@ def train_step(state, target_image, w2c, camera_static, optimizer, use_pallas=Fa
     
     lambda_ssim = 0.2
     lambda_distortion = 0.001
-    lambda_normal = 0.05
+    lambda_normal = 0.01 # Adjusted for stability
     
     def loss_fn(p):
         image, extras = render(p, camera, use_pallas=use_pallas, mode=mode, backend=backend)
@@ -44,15 +44,16 @@ def train_step(state, target_image, w2c, camera_static, optimizer, use_pallas=Fa
         }
         
         if mode == "2dgs":
-            # Add 2DGS specific regularization losses
+            # Re-enable all regularization losses with stable implementations
             l_dist = depth_distortion_loss(extras["depth"], extras["depth_sq"])
             l_normal = normal_consistency_loss(extras["normals"], extras["depth"], camera)
-            
+
             total_loss = total_loss + lambda_distortion * l_dist + lambda_normal * l_normal
             metrics.update({
                 "dist_loss": l_dist,
                 "normal_loss": l_normal
             })
+
             
         return total_loss, metrics
     

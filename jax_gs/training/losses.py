@@ -113,9 +113,20 @@ def normal_consistency_loss(rendered_normals, depth_map, camera):
     n_depth = n_depth / jnp.linalg.norm(n_depth, axis=-1, keepdims=True)
 
     # 2. Compute consistency with rendered normals
-    # rendered_normals should already be normalized or we normalize here
-    n_rendered = rendered_normals / jnp.maximum(jnp.linalg.norm(rendered_normals, axis=-1, keepdims=True), 1e-6)
-
-    # Loss is 1 - cosine similarity
-    cos_sim = jnp.sum(n_rendered * n_depth, axis=-1)
-    return jnp.mean(1.0 - cos_sim)
+    # Use a weighted version of the loss to avoid division by zero and exploding gradients.
+    # The weight is the norm of the accumulated normals (related to opacity).
+    rendered_norm = jnp.linalg.norm(rendered_normals, axis=-1, keepdims=True)
+    
+    # Safe unit normal for rendered splats - use 'double where' trick for JAX stability
+    safe_norm = jnp.where(rendered_norm > 1e-6, rendered_norm, 1.0)
+    n_rendered = jnp.where(rendered_norm > 1e-6, rendered_normals / safe_norm, 0.0)
+    
+    # Cosine similarity
+    cos_sim = jnp.sum(n_rendered * n_depth, axis=-1, keepdims=True)
+    
+    # Weighted loss: (1 - cos_sim) * stop_gradient(rendered_norm)
+    # We stop gradient on the weight so the loss only optimizes normal directions,
+    # not the existence/opacity of the splats themselves.
+    loss_map = (1.0 - cos_sim) * jax.lax.stop_gradient(rendered_norm)
+    
+    return jnp.mean(loss_map)
