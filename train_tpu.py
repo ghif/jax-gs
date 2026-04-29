@@ -40,8 +40,15 @@ def run_training_tpu(num_iterations: int = 10000):
     
     # 4. Multi-device setup
     # Replicate gaussians and opt_state across all devices
-    replicated_gaussians = jax.device_put_replicated(gaussians, devices)
-    replicated_opt_state = jax.device_put_replicated(opt_state, devices)
+    sharding = jax.sharding.NamedSharding(jax.sharding.Mesh(devices, 'batch'), jax.sharding.PartitionSpec('batch'))
+    replicated_gaussians = jax.tree_util.tree_map(
+        lambda x: jax.device_put(jnp.broadcast_to(x, (num_devices,) + x.shape), sharding), 
+        gaussians
+    )
+    replicated_opt_state = jax.tree_util.tree_map(
+        lambda x: jax.device_put(jnp.broadcast_to(x, (num_devices,) + x.shape), sharding), 
+        opt_state
+    )
     
     # Parallel training step
     @partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(4, 5))

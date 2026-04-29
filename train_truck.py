@@ -45,7 +45,11 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
     num_devices = jax.local_device_count()
     if num_devices > 1:
         print(f"Using Data Parallelism across {num_devices} devices")
-        state = jax.device_put_replicated(state, jax.local_devices())
+        sharding = jax.sharding.NamedSharding(jax.sharding.Mesh(jax.local_devices(), 'batch'), jax.sharding.PartitionSpec('batch'))
+        state = jax.tree_util.tree_map(
+            lambda x: jax.device_put(jnp.broadcast_to(x, (num_devices,) + x.shape), sharding), 
+            state
+        )
     else:
         print("Using single device training")
 

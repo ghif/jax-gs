@@ -29,7 +29,11 @@ def test_benchmark_tpu():
     )
     
     # Replicate across devices
-    gaussians_repl = jax.device_put_replicated(gaussians, devices)
+    sharding = jax.sharding.NamedSharding(jax.sharding.Mesh(devices, 'batch'), jax.sharding.PartitionSpec('batch'))
+    gaussians_repl = jax.tree_util.tree_map(
+        lambda x: jax.device_put(jnp.broadcast_to(x, (num_devices,) + x.shape), sharding), 
+        gaussians
+    )
     
     @partial(jax.pmap, in_axes=(0, None, None, None, None, None, None, None), 
                      static_broadcasted_argnums=(2, 3, 4, 5, 6, 7))
