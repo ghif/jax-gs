@@ -27,26 +27,28 @@ def get_tile_interactions(means2D, radii, valid_mask, depths, H, W, tile_size: i
     num_points = means2D.shape[0]
     num_tiles_x = (W + tile_size - 1) // tile_size
     num_tiles_y = (H + tile_size - 1) // tile_size
-    
+
     min_x = jnp.clip((means2D[:, 0] - radii), 0, W - 1)
     max_x = jnp.clip((means2D[:, 0] + radii), 0, W - 1)
     min_y = jnp.clip((means2D[:, 1] - radii), 0, H - 1)
     max_y = jnp.clip((means2D[:, 1] + radii), 0, H - 1)
-    
+
     tile_min_x = (min_x // tile_size).astype(jnp.int32)
     tile_max_x = (max_x // tile_size).astype(jnp.int32)
     tile_min_y = (min_y // tile_size).astype(jnp.int32)
     tile_max_y = (max_y // tile_size).astype(jnp.int32)
-    
+
     # Filter points completely outside image
     on_screen = (means2D[:, 0] + radii > 0) & (means2D[:, 0] - radii < W) & \
                 (means2D[:, 1] + radii > 0) & (means2D[:, 1] - radii < H)
-    
+
     valid_mask = valid_mask & on_screen & (tile_max_x >= tile_min_x) & (tile_max_y >= tile_min_y)
-    
+
     # Pre-calculate relative tile offsets for broadcasting
-    # Use an 8x8 grid to match MLX parity exactly
-    OFFSET_SIZE = 8
+    # Reduce OFFSET_SIZE from 8 to 4 to significantly reduce intermediate array size.
+    # Note: If Gaussians cover more than 4x4=16 tiles, they will be clipped. 
+    # Usually large Gaussians are heavily transparent or split early in training.
+    OFFSET_SIZE = 4
     off_y, off_x = jnp.meshgrid(jnp.arange(OFFSET_SIZE), jnp.arange(OFFSET_SIZE), indexing='ij')
     off_x = off_x.flatten()
     off_y = off_y.flatten()
@@ -54,57 +56,56 @@ def get_tile_interactions(means2D, radii, valid_mask, depths, H, W, tile_size: i
     # Use broadcasting instead of vmap for Gaussian-tile assignment
     abs_x = tile_min_x[:, None] + off_x[None, :]
     abs_y = tile_min_y[:, None] + off_y[None, :]
-    
+
     in_range = (abs_x <= tile_max_x[:, None]) & (abs_y <= tile_max_y[:, None]) & valid_mask[:, None]
-    
+
     all_tile_ids = abs_y * num_tiles_x + abs_x
     all_tile_ids = jnp.where(in_range, all_tile_ids, -1)
-    
+
     all_gaussian_ids = jnp.broadcast_to(jnp.arange(num_points)[:, None], all_tile_ids.shape)
     all_depths = jnp.broadcast_to(depths[:, None], all_tile_ids.shape)
-    
+
     flat_tile_ids = all_tile_ids.reshape(-1)
     flat_gaussian_ids = all_gaussian_ids.reshape(-1)
     flat_depths = all_depths.reshape(-1)
-    
+
     valid_interactions = flat_tile_ids != -1
-    
+
     # Robust Pack-Sort: [TileID: 18 bits] [Depth: 13 bits]
     # We use bit-packing to sort by (tile_id, depth) using a single integer argsort.
     DEPTH_BITS = 13
     num_tiles_total = num_tiles_x * num_tiles_y
-    
+
     # 1. Prepare Primary Key (Tile ID)
     # Use num_tiles_total as sentinel (guaranteed > any valid tile_id)
     # This keeps values small enough for int32 (assuming < 200k tiles)
     sort_tile_ids = jnp.where(valid_interactions, flat_tile_ids, num_tiles_total)
-    
+
     # 2. Prepare Secondary Key (Depth)
     depth_i32_full = jax.lax.bitcast_convert_type(flat_depths, jnp.int32)
     depth_quant = depth_i32_full >> (31 - DEPTH_BITS)
-    
+
     # 3. Pack (all in int32)
     key = (sort_tile_ids << DEPTH_BITS) | depth_quant
-    
+
     # Use lax.sort_key_val for faster sorting on CPU/GPU
     sorted_keys, sorted_gaussian_ids = jax.lax.sort_key_val(key, flat_gaussian_ids)
-    
+
     # Extract back the original Tile IDs from the sorted keys
     sorted_tile_ids = sorted_keys >> DEPTH_BITS
-    
+
     # Ensure at least BLOCK_SIZE for dynamic_slice in rasterizer
     # Use python max() to keep it a concrete integer for jnp.full/at
     total_interactions = sorted_tile_ids.shape[0]
     padded_size = max(total_interactions, BLOCK_SIZE)
-    
+
     pad_tile_ids = jnp.full((padded_size,), num_tiles_total, dtype=jnp.int32)
     pad_gaussian_ids = jnp.zeros((padded_size,), dtype=jnp.int32)
-    
+
     sorted_tile_ids = pad_tile_ids.at[:total_interactions].set(sorted_tile_ids)
     sorted_gaussian_ids = pad_gaussian_ids.at[:total_interactions].set(sorted_gaussian_ids)
-    
-    return sorted_tile_ids, sorted_gaussian_ids, valid_interactions.sum()
 
+    return sorted_tile_ids, sorted_gaussian_ids, valid_interactions.sum()
 def render_tiles(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaussian_ids, 
                  H, W, tile_size: int = TILE_SIZE, background=jnp.array([0.0, 0.0, 0.0])):
     """

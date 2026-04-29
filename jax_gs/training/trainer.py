@@ -44,9 +44,15 @@ def train_step(state, target_image, w2c, camera_static, optimizer, use_pallas=Fa
         }
 
         if mode == "2dgs":
+            # Unpack to allow XLA to optimize memory lifetimes more aggressively
+            depth = extras.get("depth")
+            depth_sq = extras.get("depth_sq")
+            accum_weight = extras.get("accum_weight")
+            normals = extras.get("normals")
+            
             # Pass accum_weight to the stabilized loss functions
-            l_dist = depth_distortion_loss(extras["depth"], extras["depth_sq"], extras["accum_weight"])
-            l_normal = normal_consistency_loss(extras["normals"], extras["depth"], camera)
+            l_dist = depth_distortion_loss(depth, depth_sq, accum_weight)
+            l_normal = normal_consistency_loss(normals, depth, camera)
 
             total_loss = total_loss + lambda_distortion * l_dist + lambda_normal * l_normal
             metrics.update({
@@ -92,8 +98,14 @@ def train_step_parallel(state, target_image, w2c, camera_static, optimizer, use_
         }
 
         if mode == "2dgs":
-            l_dist = depth_distortion_loss(extras["depth"], extras["depth_sq"], extras["accum_weight"])
-            l_normal = normal_consistency_loss(extras["normals"], extras["depth"], camera)
+            # Unpack to allow XLA to optimize memory lifetimes more aggressively
+            depth = extras.get("depth")
+            depth_sq = extras.get("depth_sq")
+            accum_weight = extras.get("accum_weight")
+            normals = extras.get("normals")
+            
+            l_dist = depth_distortion_loss(depth, depth_sq, accum_weight)
+            l_normal = normal_consistency_loss(normals, depth, camera)
 
             total_loss = total_loss + lambda_distortion * l_dist + lambda_normal * l_normal
             metrics.update({
