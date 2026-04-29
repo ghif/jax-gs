@@ -20,7 +20,7 @@ import jax.numpy as jnp
 
 def run_training(num_iterations: int = 10000, mode: str = "3dgs", 
                  data_path: str = "gs://dataset-nerf/tandt/truck",
-                 output_base: str = "gs://dataset-nerf/results",
+                 output_base: str = "./results",
                  use_pallas: bool = False,
                  backend: str = "gpu"):
     # 1. Load Data
@@ -139,7 +139,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_iterations", type=int, default=10000)
     parser.add_argument("--mode", type=str, default="3dgs", choices=["3dgs", "2dgs"])
     parser.add_argument("--data_path", type=str, default="gs://dataset-nerf/tandt/truck")
-    parser.add_argument("--output_path", type=str, default="gs://dataset-nerf/results")
+    parser.add_argument("--output_path", type=str, default="./results")
     parser.add_argument("--use_pallas", action="store_true", help="Use Pallas kernels for rasterization")
     parser.add_argument("--backend", type=str, default="gpu", choices=["gpu", "tpu"])
     args = parser.parse_args()

@@ -84,3 +84,4 @@ def project_gaussians_2d(gaussians: Gaussians2D, camera: Camera):
     radii = jnp.ceil(3.0 * jnp.sqrt(max_eigen))
     
     return means2D, cov2D, radii, valid_mask, z, normals
+

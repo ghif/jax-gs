@@ -45,10 +45,11 @@ def get_tile_interactions(means2D, radii, valid_mask, depths, H, W, tile_size: i
     valid_mask = valid_mask & on_screen & (tile_max_x >= tile_min_x) & (tile_max_y >= tile_min_y)
 
     # Pre-calculate relative tile offsets for broadcasting
-    # Reduce OFFSET_SIZE from 8 to 4 to significantly reduce intermediate array size.
-    # Note: If Gaussians cover more than 4x4=16 tiles, they will be clipped. 
-    # Usually large Gaussians are heavily transparent or split early in training.
-    OFFSET_SIZE = 4
+    # OFFSET_SIZE determines the maximum bounding box size of a splat in tiles.
+    # 16 means 16x16 tiles = 256x256 pixels. Splats larger than this are clipped,
+    # causing blocky rectangular boundaries. We increase this back to 16 to avoid blockiness
+    # while not causing massive OOM.
+    OFFSET_SIZE = 16
     off_y, off_x = jnp.meshgrid(jnp.arange(OFFSET_SIZE), jnp.arange(OFFSET_SIZE), indexing='ij')
     off_x = off_x.flatten()
     off_y = off_y.flatten()
@@ -144,10 +145,10 @@ def render_tiles(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaus
     tile_indices = jnp.arange(num_tiles + 1)
     tile_boundaries = jnp.searchsorted(sorted_tile_ids, tile_indices)
 
-    # Pre-calculate pixel grid for a single tile
+    # Pre-calculate pixel grid for a single tile (sample at pixel centers)
     py, px = jnp.mgrid[0:tile_size, 0:tile_size]
-    tile_pixel_x = px.astype(jnp.float32)
-    tile_pixel_y = py.astype(jnp.float32)
+    tile_pixel_x = px.astype(jnp.float32) + 0.5
+    tile_pixel_y = py.astype(jnp.float32) + 0.5
     
     def rasterize_single_tile(tile_idx):
         start_idx = tile_boundaries[tile_idx]

@@ -25,8 +25,9 @@ def render_tiles_2d(means2D, cov2D, opacities, colors, depths, normals, sorted_t
     tile_boundaries = jnp.searchsorted(sorted_tile_ids, tile_indices)
 
     py, px = jnp.mgrid[0:tile_size, 0:tile_size]
-    tile_pixel_x = px.astype(jnp.float32)
-    tile_pixel_y = py.astype(jnp.float32)
+    # Sample at pixel centers (+0.5) to avoid blocky boundaries/pixelation
+    tile_pixel_x = px.astype(jnp.float32) + 0.5
+    tile_pixel_y = py.astype(jnp.float32) + 0.5
     
     def rasterize_single_tile(tile_idx):
         start_idx = tile_boundaries[tile_idx]
