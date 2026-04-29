@@ -139,7 +139,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_iterations", type=int, default=10000)
     parser.add_argument("--mode", type=str, default="3dgs", choices=["3dgs", "2dgs"])
     parser.add_argument("--data_path", type=str, default="gs://dataset-nerf/tandt/truck")
-    parser.add_argument("--output_path", type=str, default="./results")
+    parser.add_argument("--output_path", type=str, default="gs://dataset-nerf/results")
     parser.add_argument("--use_pallas", action="store_true", help="Use Pallas kernels for rasterization")
     parser.add_argument("--backend", type=str, default="gpu", choices=["gpu", "tpu"])
     args = parser.parse_args()
