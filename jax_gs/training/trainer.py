@@ -62,3 +62,57 @@ def train_step(state, target_image, w2c, camera_static, optimizer, use_pallas=Fa
     next_params = optax.apply_updates(params, updates)
     
     return (next_params, next_opt_state), loss, metrics
+
+@partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(3, 4, 5, 6, 7))
+def train_step_parallel(state, target_image, w2c, camera_static, optimizer, use_pallas=False, mode="3dgs", backend="gpu"):
+    """
+    Data-parallel training step using pmap.
+    Each device processes one image, gradients are averaged across devices.
+    """
+    params, opt_state = state
+    W, H, fx, fy, cx, cy = camera_static
+    
+    # Reconstruct Camera object inside pmap
+    camera = Camera(W=W, H=H, fx=fx, fy=fy, cx=cx, cy=cy, W2C=w2c, full_proj=jnp.eye(4))
+    
+    lambda_ssim = 0.2
+    lambda_distortion = 0.0001
+    lambda_normal = 0.0001
+
+    def loss_fn(p):
+        image, extras = render(p, camera, use_pallas=use_pallas, mode=mode, backend=backend)
+        l1 = l1_loss(image, target_image)
+        d_ssim = d_ssim_loss(image, target_image)
+
+        total_loss = (1.0 - lambda_ssim) * l1 + lambda_ssim * d_ssim
+
+        metrics = {
+            "l1": l1,
+            "ssim": 1.0 - d_ssim * 2.0
+        }
+
+        if mode == "2dgs":
+            l_dist = depth_distortion_loss(extras["depth"], extras["depth_sq"], extras["accum_weight"])
+            l_normal = normal_consistency_loss(extras["normals"], extras["depth"], camera)
+
+            total_loss = total_loss + lambda_distortion * l_dist + lambda_normal * l_normal
+            metrics.update({
+                "dist_loss": l_dist,
+                "normal_loss": l_normal
+            })
+            
+        return total_loss, metrics
+    
+    (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    
+    # Average gradients across all devices
+    grads = jax.lax.pmean(grads, axis_name='batch')
+    
+    # Average loss and metrics for logging consistency
+    loss = jax.lax.pmean(loss, axis_name='batch')
+    metrics = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name='batch'), metrics)
+    
+    updates, next_opt_state = optimizer.update(grads, opt_state, params)
+    next_params = optax.apply_updates(params, updates)
+    
+    return (next_params, next_opt_state), loss, metrics

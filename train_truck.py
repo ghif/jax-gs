@@ -15,7 +15,8 @@ from jax_gs.core.gaussians_2d import init_gaussians_2d_from_pcd
 from jax_gs.renderer.renderer import render
 from jax_gs.io.colmap import load_colmap_dataset
 from jax_gs.io.ply import save_ply, save_ply_2d
-from jax_gs.training.trainer import train_step
+from jax_gs.training.trainer import train_step, train_step_parallel
+import jax.numpy as jnp
 
 def run_training(num_iterations: int = 10000, mode: str = "3dgs", 
                  data_path: str = "gs://dataset-nerf/tandt/truck",
@@ -24,9 +25,6 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
                  backend: str = "gpu"):
     # 1. Load Data
     path = data_path
-    # For Tanks & Temples datasets like 'truck', we typically use the original 'images' 
-    # folder, but we follow the logic of train_fern.py which specified a subfolder.
-    # Note: If 'images_8' does not exist in the truck dataset, this may need adjustment to 'images'.
     xyz, rgb, jax_cameras, jax_targets = load_colmap_dataset(path, "images")
     
     print(f"Loaded {len(xyz)} points")
@@ -43,6 +41,14 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
     opt_state = optimizer.init(gaussians)
     state = (gaussians, opt_state)
     
+    # Data Parallelism Setup
+    num_devices = jax.local_device_count()
+    if num_devices > 1:
+        print(f"Using Data Parallelism across {num_devices} devices")
+        state = jax.device_put_replicated(state, jax.local_devices())
+    else:
+        print("Using single device training")
+
     # 4. Training Loop
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = f"{output_base}/truck_{mode}_{timestamp}"
@@ -62,23 +68,42 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
     pbar = tqdm(range(num_iterations))
     
     for i in pbar:
-        # Pick random camera
-        idx = random.randint(0, len(jax_cameras)-1)
-        cam = jax_cameras[idx]
-        target = jax_targets[idx]
-        
-        # Static args for JIT
-        camera_static = (int(cam.W), int(cam.H), float(cam.fx), float(cam.fy), float(cam.cx), float(cam.cy))
-        
-        state, loss, metrics = train_step(state, target, cam.W2C, camera_static, optimizer, 
-                                         use_pallas=use_pallas, mode=mode, backend=backend)
+        if num_devices > 1:
+            # Batch multiple cameras
+            indices = [random.randint(0, len(jax_cameras)-1) for _ in range(num_devices)]
+            batch_cameras = [jax_cameras[idx] for idx in indices]
+            batch_targets = jnp.stack([jax_targets[idx] for idx in indices])
+            batch_w2c = jnp.stack([cam.W2C for cam in batch_cameras])
+            
+            # Assume all cameras in batch have same static params (resolution/intrinsics)
+            cam = batch_cameras[0]
+            camera_static = (int(cam.W), int(cam.H), float(cam.fx), float(cam.fy), float(cam.cx), float(cam.cy))
+            
+            state, loss, metrics = train_step_parallel(state, batch_targets, batch_w2c, camera_static, optimizer, 
+                                                     use_pallas, mode, backend)
+            # Loss and metrics are replicated, take the first one
+            loss = loss[0]
+        else:
+            # Pick random camera
+            idx = random.randint(0, len(jax_cameras)-1)
+            cam = jax_cameras[idx]
+            target = jax_targets[idx]
+            
+            camera_static = (int(cam.W), int(cam.H), float(cam.fx), float(cam.fy), float(cam.cx), float(cam.cy))
+            
+            state, loss, metrics = train_step(state, target, cam.W2C, camera_static, optimizer, 
+                                             use_pallas=use_pallas, mode=mode, backend=backend)
         
         if i % 10 == 0:
             pbar.set_description(f"Loss: {loss:.4f}")
             
             if i % 100 == 0:
-                # Render logic
-                img, _ = render(state[0], jax_cameras[0], mode=mode, use_pallas=use_pallas, backend=backend)
+                # Render logic (unreplicate for rendering/saving)
+                curr_gaussians = state[0]
+                if num_devices > 1:
+                    curr_gaussians = jax.tree_util.tree_map(lambda x: x[0], curr_gaussians)
+
+                img, _ = render(curr_gaussians, jax_cameras[0], mode=mode, use_pallas=use_pallas, backend=backend)
                 img_np = np.array(img)
                 
                 # Save image via fsspec
@@ -90,16 +115,20 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
                     f.write(buf.getvalue())
                 
                 if mode == "2dgs":
-                    save_ply_2d(f"{ply_dir}/truck_splats_{i:04d}.ply", state[0]) 
+                    save_ply_2d(f"{ply_dir}/truck_splats_{i:04d}.ply", curr_gaussians) 
                 else:
-                    save_ply(f"{ply_dir}/truck_splats_{i:04d}.ply", state[0]) 
+                    save_ply(f"{ply_dir}/truck_splats_{i:04d}.ply", curr_gaussians) 
 
     # Final Save
     print("Training done. Saving final model...")
+    final_gaussians = state[0]
+    if num_devices > 1:
+        final_gaussians = jax.tree_util.tree_map(lambda x: x[0], final_gaussians)
+
     if mode == "2dgs":
-        save_ply_2d(f"{output_dir}/truck_final.ply", state[0])
+        save_ply_2d(f"{output_dir}/truck_final.ply", final_gaussians)
     else:
-        save_ply(f"{output_dir}/truck_final.ply", state[0])
+        save_ply(f"{output_dir}/truck_final.ply", final_gaussians)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
