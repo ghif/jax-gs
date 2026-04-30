@@ -19,7 +19,7 @@ from jax_gs.training.trainer import train_step, train_step_parallel
 import jax.numpy as jnp
 
 def run_training(num_iterations: int = 10000, mode: str = "3dgs", 
-                 data_path: str = "gs://dataset-nerf/nerf_llff_data/fern",
+                 data_path: str = "gs://dataset-nerf/nerf_llff_data/room",
                  output_base: str = "gs://dataset-nerf/results",
                  use_pallas: bool = False,
                  backend: str = "gpu"):
@@ -55,7 +55,7 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
 
     # 4. Training Loop
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = f"{output_base}/fern_{mode}_{timestamp}"
+    output_dir = f"{output_base}/room_{mode}_{timestamp}"
     
     # Use fsspec to handle directory creation if local
     fs, _ = fsspec.core.url_to_fs(output_dir)
@@ -120,9 +120,9 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
                     f.write(buf.getvalue())
                 
                 if mode == "2dgs":
-                    save_ply_2d(f"{ply_dir}/fern_splats_{i:04d}.ply", curr_gaussians) 
+                    save_ply_2d(f"{ply_dir}/room_splats_{i:04d}.ply", curr_gaussians) 
                 else:
-                    save_ply(f"{ply_dir}/fern_splats_{i:04d}.ply", curr_gaussians) 
+                    save_ply(f"{ply_dir}/room_splats_{i:04d}.ply", curr_gaussians) 
 
     # Final Save
     print("Training done. Saving final model...")
@@ -131,15 +131,15 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
         final_gaussians = jax.tree_util.tree_map(lambda x: x[0], final_gaussians)
 
     if mode == "2dgs":
-        save_ply_2d(f"{output_dir}/fern_final.ply", final_gaussians)
+        save_ply_2d(f"{output_dir}/room_final.ply", final_gaussians)
     else:
-        save_ply(f"{output_dir}/fern_final.ply", final_gaussians)
+        save_ply(f"{output_dir}/room_final.ply", final_gaussians)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_iterations", type=int, default=10000)
     parser.add_argument("--mode", type=str, default="3dgs", choices=["3dgs", "2dgs"])
-    parser.add_argument("--data_path", type=str, default="gs://dataset-nerf/nerf_llff_data/fern")
+    parser.add_argument("--data_path", type=str, default="gs://dataset-nerf/nerf_llff_data/room")
     parser.add_argument("--output_path", type=str, default="gs://dataset-nerf/results")
     parser.add_argument("--use_pallas", action="store_true", help="Use Pallas kernels for rasterization")
     parser.add_argument("--backend", type=str, default="gpu", choices=["gpu", "tpu"])

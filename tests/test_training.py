@@ -54,7 +54,7 @@ def test_train_step_execution():
     camera_static = (16, 16, 10.0, 10.0, 8.0, 8.0) # W, H, fx, fy, cx, cy
     
     # Run step
-    new_state, loss = train_step(state, target_image, w2c, camera_static, optimizer)
+    new_state, loss, metrics = train_step(state, target_image, w2c, camera_static, optimizer)
     
     assert loss >= 0
     assert len(new_state) == 2

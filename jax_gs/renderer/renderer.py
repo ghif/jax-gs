@@ -58,12 +58,24 @@ def render(gaussians, camera: Camera, background=jnp.array([0.0, 0.0, 0.0]),
             means2D, radii, valid_mask, depths, camera.H, camera.W, TILE_SIZE
         )
         
-        # 3. Rasterize tiles (JAX only for now for 2DGS)
-        image, depth, depth_sq, normal_map, accum_weight = render_tiles_2d(
-            means2D, cov2D, gaussians.opacities, colors, depths, normals,
-            sorted_tile_ids, sorted_gaussian_ids,
-            camera.H, camera.W, TILE_SIZE, background
-        )
+        # 3. Rasterize tiles
+        if use_pallas and HAS_PALLAS:
+            image, extras = render_tiles_pallas(
+                means2D, cov2D, gaussians.opacities, colors,
+                sorted_tile_ids, sorted_gaussian_ids,
+                camera.H, camera.W, depths=depths, normals=normals,
+                backend=backend
+            )
+            depth = extras.get("depth")
+            depth_sq = extras.get("depth_sq")
+            normal_map = extras.get("normals")
+            accum_weight = extras.get("accum_weight")
+        else:
+            image, depth, depth_sq, normal_map, accum_weight = render_tiles_2d(
+                means2D, cov2D, gaussians.opacities, colors, depths, normals,
+                sorted_tile_ids, sorted_gaussian_ids,
+                camera.H, camera.W, TILE_SIZE, background
+            )
         
         extras = {
             "depth": depth,
@@ -146,12 +158,13 @@ def render(gaussians, camera: Camera, background=jnp.array([0.0, 0.0, 0.0]),
         
         if use_pallas and HAS_PALLAS:
             # 4. Rasterize tiles using Pallas
-            image = render_tiles_pallas(
+            image, extras = render_tiles_pallas(
                 means2D, cov2D, gaussians.opacities, colors,
                 sorted_tile_ids, sorted_gaussian_ids,
                 camera.H, camera.W, TILE_SIZE, background,
                 backend=backend
             )
+            return image, extras
         else:
             # 4. Rasterize tiles using pure JAX
             image = render_tiles(
@@ -159,4 +172,4 @@ def render(gaussians, camera: Camera, background=jnp.array([0.0, 0.0, 0.0]),
                 sorted_tile_ids, sorted_gaussian_ids,
                 camera.H, camera.W, TILE_SIZE, background
             )
-        return image, {}
+            return image, {}

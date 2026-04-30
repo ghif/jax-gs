@@ -42,7 +42,7 @@ def test_benchmark_training_fern():
     # JIT Warm-up (This will be slow as it compiles the whole grad function)
     print("Warming up (JIT compilation of train_step)...")
     start_warm = time.perf_counter()
-    state, loss = train_step(state, target, camera.W2C, camera_static, optimizer)
+    state, loss, metrics = train_step(state, target, camera.W2C, camera_static, optimizer)
     jax.block_until_ready(loss)
     end_warm = time.perf_counter()
     print(f"Warm-up/Compilation took {end_warm - start_warm:.4f}s")
@@ -59,7 +59,7 @@ def test_benchmark_training_fern():
         curr_target = jax_targets[cam_idx]
         
         start = time.perf_counter()
-        state, loss = train_step(state, curr_target, curr_cam.W2C, camera_static, optimizer)
+        state, loss, metrics = train_step(state, curr_target, curr_cam.W2C, camera_static, optimizer)
         jax.block_until_ready(loss)
         end = time.perf_counter()
         times.append(end - start)
