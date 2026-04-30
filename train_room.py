@@ -27,6 +27,12 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
     path = data_path
     xyz, rgb, jax_cameras, jax_targets = load_colmap_dataset(path, "images_8")
     
+    # FIX: Some COLMAP exports (like LLFF room) have missing colors (all zeros).
+    # This causes dead gradients when SH colors are clipped at exactly 0.0.
+    if np.max(rgb) == 0.0:
+        print("Warning: Point cloud has no colors. Initializing to gray to prevent dead gradients.")
+        rgb = np.full_like(rgb, 0.5)
+    
     print(f"Loaded {len(xyz)} points")
     print(f"Prepared {len(jax_cameras)} cameras for training")
     
