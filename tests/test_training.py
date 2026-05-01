@@ -54,10 +54,12 @@ def test_train_step_execution():
     camera_static = (16, 16, 10.0, 10.0, 8.0, 8.0) # W, H, fx, fy, cx, cy
     
     # Run step
-    new_state, loss = train_step(state, target_image, w2c, camera_static, optimizer)
+    new_state, loss, metrics = train_step(state, target_image, w2c, camera_static, optimizer)
     
     assert loss >= 0
     assert len(new_state) == 2
+    assert "l1" in metrics
+    assert "ssim" in metrics
     # Verify parameters changed (gradient flow)
     # Since target is 0 and init is 0 (sigmoid(op) > 0), loss will be > 0 and params should update
     assert not jnp.allclose(new_state[0].means, gaussians.means)

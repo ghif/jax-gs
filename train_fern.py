@@ -10,18 +10,28 @@ import io
 from tqdm import tqdm
 from PIL import Image
 
-from jax_gs.core.gaussians import init_gaussians_from_pcd
-from jax_gs.core.gaussians_2d import init_gaussians_2d_from_pcd
-from jax_gs.renderer.renderer import render
 from jax_gs.io.colmap import load_colmap_dataset
-from jax_gs.io.ply import save_ply, save_ply_2d
-from jax_gs.training.trainer import train_step
 
 def run_training(num_iterations: int = 10000, mode: str = "3dgs", 
                  data_path: str = "gs://dataset-nerf/nerf_llff_data/fern",
                  output_base: str = "gs://dataset-nerf/results",
                  use_pallas: bool = False,
                  backend: str = "gpu"):
+    
+    # Conditional imports based on mode
+    if mode == "2dgs":
+        from jax_2dgs.core.gaussians_2d import init_gaussians_2d_from_pcd
+        from jax_2dgs.training.trainer import train_step
+        from jax_2dgs.renderer.renderer import render
+        from jax_2dgs.io.ply import save_ply_2d as save_ply
+        init_fn = init_gaussians_2d_from_pcd
+    else:
+        from jax_gs.core.gaussians import init_gaussians_from_pcd
+        from jax_gs.training.trainer import train_step
+        from jax_gs.renderer.renderer import render
+        from jax_gs.io.ply import save_ply
+        init_fn = init_gaussians_from_pcd
+
     # 1. Load Data
     path = data_path
     xyz, rgb, jax_cameras, jax_targets = load_colmap_dataset(path, "images_8")
@@ -30,10 +40,7 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
     print(f"Prepared {len(jax_cameras)} cameras for training")
     
     # 2. Initialize Gaussians
-    if mode == "2dgs":
-        gaussians = init_gaussians_2d_from_pcd(np.array(xyz), np.array(rgb))
-    else:
-        gaussians = init_gaussians_from_pcd(np.array(xyz), np.array(rgb))
+    gaussians = init_fn(np.array(xyz), np.array(rgb))
     
     # 3. Setup Optimizer
     optimizer = optax.adam(learning_rate=1e-3)
@@ -68,14 +75,14 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
         camera_static = (int(cam.W), int(cam.H), float(cam.fx), float(cam.fy), float(cam.cx), float(cam.cy))
         
         state, loss, metrics = train_step(state, target, cam.W2C, camera_static, optimizer, 
-                                         use_pallas=use_pallas, mode=mode, backend=backend)
+                                         use_pallas=use_pallas, backend=backend)
         
         if i % 10 == 0:
             pbar.set_description(f"Loss: {loss:.4f}")
             
             if i % 100 == 0:
                 # Render logic
-                img, _ = render(state[0], jax_cameras[0], mode=mode, use_pallas=use_pallas, backend=backend)
+                img, _ = render(state[0], jax_cameras[0], use_pallas=use_pallas, backend=backend)
                 img_np = np.array(img)
                 
                 # Save image via fsspec
@@ -86,17 +93,11 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
                     pil_img.save(buf, format="PNG")
                     f.write(buf.getvalue())
                 
-                if mode == "2dgs":
-                    save_ply_2d(f"{ply_dir}/fern_splats_{i:04d}.ply", state[0]) 
-                else:
-                    save_ply(f"{ply_dir}/fern_splats_{i:04d}.ply", state[0]) 
+                save_ply(f"{ply_dir}/fern_splats_{i:04d}.ply", state[0]) 
 
     # Final Save
     print("Training done. Saving final model...")
-    if mode == "2dgs":
-        save_ply_2d(f"{output_dir}/fern_final.ply", state[0])
-    else:
-        save_ply(f"{output_dir}/fern_final.ply", state[0])
+    save_ply(f"{output_dir}/fern_final.ply", state[0])
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

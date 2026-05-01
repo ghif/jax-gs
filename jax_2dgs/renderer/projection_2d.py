@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from jax_gs.core.gaussians_2d import Gaussians2D, get_tangent_vectors
+from jax_2dgs.core.gaussians_2d import Gaussians2D, get_tangent_vectors
 from jax_gs.core.camera import Camera
 
 def project_gaussians_2d(gaussians: Gaussians2D, camera: Camera):

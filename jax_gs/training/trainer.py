@@ -6,7 +6,7 @@ from jax_gs.training.losses import l1_loss, d_ssim_loss
 from jax_gs.core.camera import Camera
 import jax.numpy as jnp
 
-@partial(jax.jit, static_argnums=(3, 4, 5, 6, 7))
+@partial(jax.jit, static_argnums=(3, 4, 5, 6))
 def train_step(state, target_image, w2c, camera_static, optimizer, use_pallas=False, backend="gpu"):
     """
     Standard training step for 3DGS.
@@ -49,7 +49,7 @@ def train_step(state, target_image, w2c, camera_static, optimizer, use_pallas=Fa
     
     return (next_params, next_opt_state), loss, metrics
 
-@partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(3, 4, 5, 6, 7))
+@partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(3, 4, 5, 6))
 def train_step_parallel(state, target_image, w2c, camera_static, optimizer, use_pallas=False, backend="gpu"):
     """
     Data-parallel training step for 3DGS using pmap.

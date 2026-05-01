@@ -10,12 +10,7 @@ import io
 from tqdm import tqdm
 from PIL import Image
 
-from jax_gs.core.gaussians import init_gaussians_from_pcd
-from jax_gs.core.gaussians_2d import init_gaussians_2d_from_pcd
-from jax_gs.renderer.renderer import render
 from jax_gs.io.colmap import load_colmap_dataset
-from jax_gs.io.ply import save_ply, save_ply_2d
-from jax_gs.training.trainer import train_step, train_step_parallel
 import jax.numpy as jnp
 
 def run_training(num_iterations: int = 10000, mode: str = "3dgs", 
@@ -23,6 +18,21 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
                  output_base: str = "./results",
                  use_pallas: bool = False,
                  backend: str = "gpu"):
+    
+    # Conditional imports based on mode
+    if mode == "2dgs":
+        from jax_2dgs.core.gaussians_2d import init_gaussians_2d_from_pcd
+        from jax_2dgs.training.trainer import train_step, train_step_parallel
+        from jax_2dgs.renderer.renderer import render
+        from jax_2dgs.io.ply import save_ply_2d as save_ply
+        init_fn = init_gaussians_2d_from_pcd
+    else:
+        from jax_gs.core.gaussians import init_gaussians_from_pcd
+        from jax_gs.training.trainer import train_step, train_step_parallel
+        from jax_gs.renderer.renderer import render
+        from jax_gs.io.ply import save_ply
+        init_fn = init_gaussians_from_pcd
+
     # 1. Load Data
     path = data_path
     xyz, rgb, jax_cameras, jax_targets = load_colmap_dataset(path, "images")
@@ -31,10 +41,7 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
     print(f"Prepared {len(jax_cameras)} cameras for training")
     
     # 2. Initialize Gaussians
-    if mode == "2dgs":
-        gaussians = init_gaussians_2d_from_pcd(np.array(xyz), np.array(rgb))
-    else:
-        gaussians = init_gaussians_from_pcd(np.array(xyz), np.array(rgb))
+    gaussians = init_fn(np.array(xyz), np.array(rgb))
     
     # 3. Setup Optimizer
     optimizer = optax.adam(learning_rate=1e-3)
@@ -84,7 +91,7 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
             camera_static = (int(cam.W), int(cam.H), float(cam.fx), float(cam.fy), float(cam.cx), float(cam.cy))
             
             state, loss, metrics = train_step_parallel(state, batch_targets, batch_w2c, camera_static, optimizer, 
-                                                     use_pallas, mode, backend)
+                                                     use_pallas, backend)
             # Loss and metrics are replicated, take the first one
             loss = loss[0]
         else:
@@ -96,7 +103,7 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
             camera_static = (int(cam.W), int(cam.H), float(cam.fx), float(cam.fy), float(cam.cx), float(cam.cy))
             
             state, loss, metrics = train_step(state, target, cam.W2C, camera_static, optimizer, 
-                                             use_pallas=use_pallas, mode=mode, backend=backend)
+                                             use_pallas=use_pallas, backend=backend)
         
         if i % 10 == 0:
             pbar.set_description(f"Loss: {loss:.4f}")
@@ -107,7 +114,7 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
                 if num_devices > 1:
                     curr_gaussians = jax.tree_util.tree_map(lambda x: x[0], curr_gaussians)
 
-                img, _ = render(curr_gaussians, jax_cameras[0], mode=mode, use_pallas=use_pallas, backend=backend)
+                img, _ = render(curr_gaussians, jax_cameras[0], use_pallas=use_pallas, backend=backend)
                 img_np = np.array(img)
                 
                 # Save image via fsspec
@@ -118,10 +125,7 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
                     pil_img.save(buf, format="PNG")
                     f.write(buf.getvalue())
                 
-                if mode == "2dgs":
-                    save_ply_2d(f"{ply_dir}/truck_splats_{i:04d}.ply", curr_gaussians) 
-                else:
-                    save_ply(f"{ply_dir}/truck_splats_{i:04d}.ply", curr_gaussians) 
+                save_ply(f"{ply_dir}/truck_splats_{i:04d}.ply", curr_gaussians) 
 
     # Final Save
     print("Training done. Saving final model...")
@@ -129,10 +133,7 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
     if num_devices > 1:
         final_gaussians = jax.tree_util.tree_map(lambda x: x[0], final_gaussians)
 
-    if mode == "2dgs":
-        save_ply_2d(f"{output_dir}/truck_final.ply", final_gaussians)
-    else:
-        save_ply(f"{output_dir}/truck_final.ply", final_gaussians)
+    save_ply(f"{output_dir}/truck_final.ply", final_gaussians)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
