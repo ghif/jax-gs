@@ -58,6 +58,8 @@ def test_train_step_execution():
     
     assert loss >= 0
     assert len(new_state) == 2
+    assert "l1" in metrics
+    assert "ssim" in metrics
     # Verify parameters changed (gradient flow)
     # Since target is 0 and init is 0 (sigmoid(op) > 0), loss will be > 0 and params should update
     assert not jnp.allclose(new_state[0].means, gaussians.means)

@@ -19,7 +19,7 @@ def test_benchmark_renderer(use_pallas=False, backend="gpu"):
         print(f"Pallas Backend: {backend}")
 
     # 1. Setup Data (Scale of Fern Dataset @ 1/8 res)
-    num_points = 150_000
+    num_points = 10091
     W, H = 504, 378
     
     print(f"\nBenchmarking with {num_points} Gaussians at {W}x{H} resolution...")

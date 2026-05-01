@@ -1,8 +1,8 @@
 import jax
 import jax.numpy as jnp
 import pytest
-from jax_gs.core.gaussians_2d import Gaussians2D, get_tangent_vectors, init_gaussians_2d_from_pcd
-from jax_gs.renderer.projection_2d import project_gaussians_2d
+from jax_2dgs.core.gaussians_2d import Gaussians2D, get_tangent_vectors, init_gaussians_2d_from_pcd
+from jax_2dgs.renderer.projection_2d import project_gaussians_2d
 from jax_gs.core.camera import Camera
 
 def test_gaussians_2d_init():

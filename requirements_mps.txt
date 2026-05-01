@@ -1,4 +1,4 @@
-# jax-metal removed in favor of mlx for Apple Silicon acceleration
+# Optimized for Apple Silicon (MPS)
 jax==0.9.0
 jaxlib==0.9.0
 chex==0.1.91
@@ -10,7 +10,5 @@ pillow
 tqdm
 matplotlib
 pytest
-mlx
-torch
 fsspec
 gcsfs

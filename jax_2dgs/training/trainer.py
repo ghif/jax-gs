@@ -1,15 +1,16 @@
 import jax
 import optax
 from functools import partial
-from jax_gs.renderer.renderer import render
+from jax_2dgs.renderer.renderer import render
 from jax_gs.training.losses import l1_loss, d_ssim_loss
+from jax_2dgs.training.losses import depth_distortion_loss, normal_consistency_loss
 from jax_gs.core.camera import Camera
 import jax.numpy as jnp
 
 @partial(jax.jit, static_argnums=(3, 4, 5, 6))
 def train_step(state, target_image, w2c, camera_static, optimizer, use_pallas=False, backend="gpu"):
     """
-    Standard training step for 3DGS.
+    Standard training step for 2DGS.
     Args:
         state: (params, opt_state)
         target_image: (H, W, 3)
@@ -28,6 +29,8 @@ def train_step(state, target_image, w2c, camera_static, optimizer, use_pallas=Fa
     camera = Camera(W=W, H=H, fx=fx, fy=fy, cx=cx, cy=cy, W2C=w2c, full_proj=jnp.eye(4))
     
     lambda_ssim = 0.2
+    lambda_distortion = 0.0001
+    lambda_normal = 0.0001
 
     def loss_fn(p):
         image, extras = render(p, camera, use_pallas=use_pallas, backend=backend)
@@ -40,6 +43,22 @@ def train_step(state, target_image, w2c, camera_static, optimizer, use_pallas=Fa
             "l1": l1,
             "ssim": 1.0 - d_ssim * 2.0
         }
+
+        # Unpack to allow XLA to optimize memory lifetimes more aggressively
+        depth = extras.get("depth")
+        depth_sq = extras.get("depth_sq")
+        accum_weight = extras.get("accum_weight")
+        normals = extras.get("normals")
+        
+        # Pass accum_weight to the stabilized loss functions
+        l_dist = depth_distortion_loss(depth, depth_sq, accum_weight)
+        l_normal = normal_consistency_loss(normals, depth, camera)
+
+        total_loss = total_loss + lambda_distortion * l_dist + lambda_normal * l_normal
+        metrics.update({
+            "dist_loss": l_dist,
+            "normal_loss": l_normal
+        })
 
         return total_loss, metrics
     
@@ -52,7 +71,7 @@ def train_step(state, target_image, w2c, camera_static, optimizer, use_pallas=Fa
 @partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(3, 4, 5, 6))
 def train_step_parallel(state, target_image, w2c, camera_static, optimizer, use_pallas=False, backend="gpu"):
     """
-    Data-parallel training step for 3DGS using pmap.
+    Data-parallel training step for 2DGS using pmap.
     Each device processes one image, gradients are averaged across devices.
     """
     params, opt_state = state
@@ -62,6 +81,8 @@ def train_step_parallel(state, target_image, w2c, camera_static, optimizer, use_
     camera = Camera(W=W, H=H, fx=fx, fy=fy, cx=cx, cy=cy, W2C=w2c, full_proj=jnp.eye(4))
     
     lambda_ssim = 0.2
+    lambda_distortion = 0.0001
+    lambda_normal = 0.0001
 
     def loss_fn(p):
         image, extras = render(p, camera, use_pallas=use_pallas, backend=backend)
@@ -74,6 +95,21 @@ def train_step_parallel(state, target_image, w2c, camera_static, optimizer, use_
             "l1": l1,
             "ssim": 1.0 - d_ssim * 2.0
         }
+
+        # Unpack to allow XLA to optimize memory lifetimes more aggressively
+        depth = extras.get("depth")
+        depth_sq = extras.get("depth_sq")
+        accum_weight = extras.get("accum_weight")
+        normals = extras.get("normals")
+        
+        l_dist = depth_distortion_loss(depth, depth_sq, accum_weight)
+        l_normal = normal_consistency_loss(normals, depth, camera)
+
+        total_loss = total_loss + lambda_distortion * l_dist + lambda_normal * l_normal
+        metrics.update({
+            "dist_loss": l_dist,
+            "normal_loss": l_normal
+        })
             
         return total_loss, metrics
     

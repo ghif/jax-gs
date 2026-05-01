@@ -71,7 +71,7 @@ def run_resume_training(num_iterations: int = 10000):
         target = jax_targets[idx]
         
         camera_static = (int(cam.W), int(cam.H), float(cam.fx), float(cam.fy), float(cam.cx), float(cam.cy))
-        state, loss = train_step(state, target, cam.W2C, camera_static, optimizer)
+        state, loss, metrics = train_step(state, target, cam.W2C, camera_static, optimizer)
         
         if i % 10 == 0:
             pbar.set_description(f"Iter {curr_iter} | Loss: {loss:.4f}")
