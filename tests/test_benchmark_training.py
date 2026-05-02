@@ -66,8 +66,8 @@ def test_benchmark_training_fern():
         print(f"  Iteration {i+1}: {end - start:.4f}s (Loss: {float(loss):.4f})")
     
     # Skip iteration 1 for warmup
-    times = times[1:]
-    num_runs -= 1
+    times = times[2:]
+    num_runs -= 2
         
     avg_time = sum(times) / num_runs
     it_per_sec = 1.0 / avg_time

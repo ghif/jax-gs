@@ -12,11 +12,11 @@ from PIL import Image
 
 from jax_gs.io.colmap import load_colmap_dataset
 
-def run_training(num_iterations: int = 10000, mode: str = "3dgs", 
+def run_training(num_iterations: int = 30000, mode: str = "3dgs", 
                  data_path: str = "gs://dataset-nerf/nerf_llff_data/fern",
                  output_base: str = "gs://dataset-nerf/results",
                  use_pallas: bool = False,
-                 backend: str = "gpu"):
+                 backend: str = "tpu"):
     
     # Conditional imports based on mode
     if mode == "2dgs":
@@ -101,12 +101,12 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num_iterations", type=int, default=10000)
+    parser.add_argument("--num_iterations", type=int, default=30000)
     parser.add_argument("--mode", type=str, default="3dgs", choices=["3dgs", "2dgs"])
     parser.add_argument("--data_path", type=str, default="gs://dataset-nerf/nerf_llff_data/fern")
     parser.add_argument("--output_path", type=str, default="gs://dataset-nerf/results")
     parser.add_argument("--use_pallas", action="store_true", help="Use Pallas kernels for rasterization")
-    parser.add_argument("--backend", type=str, default="gpu", choices=["gpu", "tpu"])
+    parser.add_argument("--backend", type=str, default="tpu", choices=["gpu", "tpu"])
     args = parser.parse_args()
     
     run_training(num_iterations=args.num_iterations, mode=args.mode, 
