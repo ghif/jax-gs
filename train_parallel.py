@@ -39,17 +39,10 @@ def train_block(state, rng_key, all_targets, all_w2cs, steps_per_block, camera_s
     (state, rng_key), losses = jax.lax.scan(one_step, (state, rng_key), None, length=steps_per_block)
     return state, rng_key, losses
 
-def save_artifacts_task(gaussians, iteration, progress_dir, ply_dir, camera, use_pallas, backend, mode):
+def save_artifacts_task(gaussians, iteration, progress_dir, ply_dir, camera, use_pallas, backend, mode, scene_name, render_fn, save_ply_fn):
     """Task to be run in a background thread."""
-    if mode == "2dgs":
-        from jax_2dgs.renderer.renderer import render
-        from jax_2dgs.io.ply import save_ply_2d as save_ply
-    else:
-        from jax_gs.renderer.renderer import render
-        from jax_gs.io.ply import save_ply
-        
     # Trigger render (async on TPU)
-    img, _ = render(gaussians, camera, use_pallas=use_pallas, backend=backend)
+    img, _ = render_fn(gaussians, camera, use_pallas=use_pallas, backend=backend)
     
     # Materialize image to host (blocks thread, but not main training loop)
     img_np = np.array(img)
@@ -63,20 +56,25 @@ def save_artifacts_task(gaussians, iteration, progress_dir, ply_dir, camera, use
         f.write(buf.getvalue())
     
     # Save PLY (materializes Gaussians to host)
-    save_ply(f"{ply_dir}/fern_splats_{iteration:04d}.ply", gaussians)
+    save_ply_fn(f"{ply_dir}/{scene_name}_splats_{iteration:04d}.ply", gaussians)
 
 def run_parallel_training(num_iterations: int = 30000, mode: str = "3dgs", 
                           data_path: str = "gs://dataset-nerf/nerf_llff_data/fern",
                           output_base: str = "gs://dataset-nerf/results",
                           use_pallas: bool = False,
-                          backend: str = "tpu"):
+                          backend: str = "tpu",
+                          images_subdir: str = "images_8"):
     
     # 0. TPU Init
     devices = jax.devices()
     num_devices = len(devices)
     print(f"Found {num_devices} devices: {devices}")
     
-    # Conditional imports based on mode
+    # Infer scene name from path
+    scene_name = os.path.basename(data_path.rstrip('/'))
+    print(f"Parallel training on scene: {scene_name} (mode: {mode})")
+
+    # Conditional logic based on mode (Dependency Injection)
     if mode == "2dgs":
         from jax_2dgs.core.gaussians_2d import init_gaussians_2d_from_pcd
         from jax_2dgs.io.ply import save_ply_2d as save_ply
@@ -90,7 +88,7 @@ def run_parallel_training(num_iterations: int = 30000, mode: str = "3dgs",
 
     # 1. Load Data
     path = data_path
-    xyz, rgb, jax_cameras, jax_targets = load_colmap_dataset(path, "images_8")
+    xyz, rgb, jax_cameras, jax_targets = load_colmap_dataset(path, images_subdir)
     
     print(f"Loaded {len(xyz)} points")
     print(f"Prepared {len(jax_cameras)} cameras for training")
@@ -123,7 +121,7 @@ def run_parallel_training(num_iterations: int = 30000, mode: str = "3dgs",
     
     # 5. Training Loop
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = f"{output_base}/fern_parallel_{mode}_{timestamp}"
+    output_dir = f"{output_base}/{scene_name}_parallel_{mode}_{timestamp}"
     
     fs, _ = fsspec.core.url_to_fs(output_dir)
     if fs.protocol == 'file' or (isinstance(fs.protocol, (list, tuple)) and 'file' in fs.protocol):
@@ -165,15 +163,13 @@ def run_parallel_training(num_iterations: int = 30000, mode: str = "3dgs",
         
         if curr_iter % 1000 == 0:
             # Capture state for background task
-            # Note: JAX arrays are immutable, so this is a reference to the state at this point.
-            # Transfer to host will happen in the thread.
             snap_gaussians = jax.tree_util.tree_map(lambda x: x[0], curr_state[0])
             
-            # Submit background task
+            # Submit background task (inject render and save_ply functions)
             fut = executor.submit(
                 save_artifacts_task, 
                 snap_gaussians, curr_iter, progress_dir, ply_dir, 
-                jax_cameras[0], use_pallas, backend, mode
+                jax_cameras[0], use_pallas, backend, mode, scene_name, render, save_ply
             )
             futures.append(fut)
             
@@ -187,7 +183,7 @@ def run_parallel_training(num_iterations: int = 30000, mode: str = "3dgs",
 
     print("Training done. Saving final model...")
     final_gaussians = jax.tree_util.tree_map(lambda x: x[0], curr_state[0])
-    save_ply(f"{output_dir}/fern_final.ply", final_gaussians)
+    save_ply(f"{output_dir}/{scene_name}_final.ply", final_gaussians)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -195,10 +191,12 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, default="3dgs", choices=["3dgs", "2dgs"])
     parser.add_argument("--data_path", type=str, default="gs://dataset-nerf/nerf_llff_data/fern")
     parser.add_argument("--output_path", type=str, default="gs://dataset-nerf/results")
+    parser.add_argument("--images_subdir", type=str, default="images_8")
     parser.add_argument("--use_pallas", action="store_true", help="Use Pallas kernels for rasterization")
     parser.add_argument("--backend", type=str, default="tpu", choices=["gpu", "tpu"])
     args = parser.parse_args()
     
     run_parallel_training(num_iterations=args.num_iterations, mode=args.mode, 
                           data_path=args.data_path, output_base=args.output_path,
-                          use_pallas=args.use_pallas, backend=args.backend)
+                          use_pallas=args.use_pallas, backend=args.backend,
+                          images_subdir=args.images_subdir)
