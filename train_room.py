@@ -1,4 +1,5 @@
 import jax
+import jax.numpy as jnp
 import optax
 import numpy as np
 import os
@@ -9,61 +10,99 @@ import fsspec
 import io
 from tqdm import tqdm
 from PIL import Image
+from functools import partial
+import concurrent.futures
 
-from jax_gs.core.gaussians import init_gaussians_from_pcd
-from jax_gs.core.gaussians_2d import init_gaussians_2d_from_pcd
-from jax_gs.renderer.renderer import render
 from jax_gs.io.colmap import load_colmap_dataset
-from jax_gs.io.ply import save_ply, save_ply_2d
-from jax_gs.training.trainer import train_step, train_step_parallel
-import jax.numpy as jnp
 
-def run_training(num_iterations: int = 10000, mode: str = "3dgs", 
+def save_artifacts_task(gaussians, iteration, progress_dir, ply_dir, camera, use_pallas, backend, mode):
+    """Task to be run in a background thread."""
+    if mode == "2dgs":
+        from jax_2dgs.renderer.renderer import render
+        from jax_2dgs.io.ply import save_ply_2d as save_ply
+    else:
+        from jax_gs.renderer.renderer import render
+        from jax_gs.io.ply import save_ply
+        
+    # Trigger render (async on TPU)
+    img, _ = render(gaussians, camera, use_pallas=use_pallas, backend=backend)
+    
+    # Materialize image to host (blocks thread, but not main training loop)
+    img_np = np.array(img)
+    
+    # Save image
+    img_path = f"{progress_dir}/progress_{iteration:04d}.png"
+    with fsspec.open(img_path, "wb") as f:
+        pil_img = Image.fromarray((np.clip(img_np, 0, 1) * 255).astype(np.uint8))
+        buf = io.BytesIO()
+        pil_img.save(buf, format="PNG")
+        f.write(buf.getvalue())
+    
+    # Save PLY (materializes Gaussians to host)
+    save_ply(f"{ply_dir}/room_splats_{iteration:04d}.ply", gaussians)
+
+def run_training(num_iterations: int = 30000, mode: str = "3dgs", 
                  data_path: str = "gs://dataset-nerf/nerf_llff_data/room",
                  output_base: str = "gs://dataset-nerf/results",
                  use_pallas: bool = False,
-                 backend: str = "gpu"):
+                 backend: str = "tpu"):
+    
+    # Conditional imports based on mode
+    if mode == "2dgs":
+        from jax_2dgs.core.gaussians_2d import init_gaussians_2d_from_pcd
+        from jax_2dgs.io.ply import save_ply_2d as save_ply
+        from jax_2dgs.training.trainer import train_step
+        init_fn = init_gaussians_2d_from_pcd
+    else:
+        from jax_gs.core.gaussians import init_gaussians_from_pcd
+        from jax_gs.io.ply import save_ply
+        from jax_gs.training.trainer import train_step
+        init_fn = init_gaussians_from_pcd
+
+    @partial(jax.jit, static_argnums=(4, 5, 6, 7, 8))
+    def train_block(state, rng_key, all_targets, all_w2cs, steps_per_block, camera_static, optimizer, use_pallas, backend):
+        def one_step(carry, _):
+            state, key = carry
+            key, subkey = jax.random.split(key)
+            
+            # Sample camera index
+            idx = jax.random.randint(subkey, (), 0, all_targets.shape[0])
+            target = all_targets[idx]
+            w2c = all_w2cs[idx]
+            
+            # Perform training step
+            state, loss, metrics = train_step(state, target, w2c, camera_static, optimizer, use_pallas, backend)
+            
+            return (state, key), loss
+
+        (state, rng_key), losses = jax.lax.scan(one_step, (state, rng_key), None, length=steps_per_block)
+        return state, rng_key, losses
+
     # 1. Load Data
     path = data_path
     xyz, rgb, jax_cameras, jax_targets = load_colmap_dataset(path, "images_8")
-    
-    # FIX: Some COLMAP exports (like LLFF room) have missing colors (all zeros).
-    # This causes dead gradients when SH colors are clipped at exactly 0.0.
-    if np.max(rgb) == 0.0:
-        print("Warning: Point cloud has no colors. Initializing to gray to prevent dead gradients.")
-        rgb = np.full_like(rgb, 0.5)
     
     print(f"Loaded {len(xyz)} points")
     print(f"Prepared {len(jax_cameras)} cameras for training")
     
     # 2. Initialize Gaussians
-    if mode == "2dgs":
-        gaussians = init_gaussians_2d_from_pcd(np.array(xyz), np.array(rgb))
-    else:
-        gaussians = init_gaussians_from_pcd(np.array(xyz), np.array(rgb))
+    gaussians = init_fn(np.array(xyz), np.array(rgb))
     
     # 3. Setup Optimizer
     optimizer = optax.adam(learning_rate=1e-3)
     opt_state = optimizer.init(gaussians)
     state = (gaussians, opt_state)
     
-    # Data Parallelism Setup
-    num_devices = jax.local_device_count()
-    if num_devices > 1:
-        print(f"Using Data Parallelism across {num_devices} devices")
-        sharding = jax.sharding.NamedSharding(jax.sharding.Mesh(jax.local_devices(), 'batch'), jax.sharding.PartitionSpec('batch'))
-        state = jax.tree_util.tree_map(
-            lambda x: jax.device_put(jnp.broadcast_to(x, (num_devices,) + x.shape), sharding), 
-            state
-        )
-    else:
-        print("Using single device training")
-
-    # 4. Training Loop
+    # 4. Prepare data on device
+    all_targets = jnp.stack(jax_targets)
+    all_w2cs = jnp.stack([c.W2C for c in jax_cameras])
+    
+    rng = jax.random.PRNGKey(random.randint(0, 10000))
+    
+    # 5. Training Loop
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = f"{output_base}/room_{mode}_{timestamp}"
     
-    # Use fsspec to handle directory creation if local
     fs, _ = fsspec.core.url_to_fs(output_dir)
     if fs.protocol == 'file' or (isinstance(fs.protocol, (list, tuple)) and 'file' in fs.protocol):
         os.makedirs(output_dir, exist_ok=True)
@@ -75,80 +114,64 @@ def run_training(num_iterations: int = 10000, mode: str = "3dgs",
         os.makedirs(progress_dir, exist_ok=True)
         os.makedirs(ply_dir, exist_ok=True)
 
-    pbar = tqdm(range(num_iterations))
+    steps_per_block = 500
+    num_blocks = num_iterations // steps_per_block
     
-    for i in pbar:
-        if num_devices > 1:
-            # Batch multiple cameras
-            indices = [random.randint(0, len(jax_cameras)-1) for _ in range(num_devices)]
-            batch_cameras = [jax_cameras[idx] for idx in indices]
-            batch_targets = jnp.stack([jax_targets[idx] for idx in indices])
-            batch_w2c = jnp.stack([cam.W2C for cam in batch_cameras])
-            
-            # Assume all cameras in batch have same static params (resolution/intrinsics)
-            cam = batch_cameras[0]
-            camera_static = (int(cam.W), int(cam.H), float(cam.fx), float(cam.fy), float(cam.cx), float(cam.cy))
-            
-            state, loss, metrics = train_step_parallel(state, batch_targets, batch_w2c, camera_static, optimizer, 
-                                                     use_pallas, mode, backend)
-            # Loss and metrics are replicated, take the first one
-            loss = loss[0]
-        else:
-            # Pick random camera
-            idx = random.randint(0, len(jax_cameras)-1)
-            cam = jax_cameras[idx]
-            target = jax_targets[idx]
-            
-            # Static args for JIT
-            camera_static = (int(cam.W), int(cam.H), float(cam.fx), float(cam.fy), float(cam.cx), float(cam.cy))
-            
-            state, loss, metrics = train_step(state, target, cam.W2C, camera_static, optimizer, 
-                                             use_pallas=use_pallas, mode=mode, backend=backend)
-        
-        if i % 10 == 0:
-            pbar.set_description(f"Loss: {loss:.4f}")
-            
-            if i % 100 == 0:
-                # Render logic (unreplicate for rendering/saving)
-                curr_gaussians = state[0]
-                if num_devices > 1:
-                    curr_gaussians = jax.tree_util.tree_map(lambda x: x[0], curr_gaussians)
+    pbar = tqdm(range(num_blocks))
+    
+    cam0 = jax_cameras[0]
+    camera_static = (int(cam0.W), int(cam0.H), float(cam0.fx), float(cam0.fy), float(cam0.cx), float(cam0.cy))
+    
+    curr_state = state
+    curr_rng = rng
 
-                img, _ = render(curr_gaussians, jax_cameras[0], mode=mode, use_pallas=use_pallas, backend=backend)
-                img_np = np.array(img)
-                
-                # Save image via fsspec
-                img_path = f"{progress_dir}/progress_{i:04d}.png"
-                with fsspec.open(img_path, "wb") as f:
-                    pil_img = Image.fromarray((np.clip(img_np, 0, 1) * 255).astype(np.uint8))
-                    buf = io.BytesIO()
-                    pil_img.save(buf, format="PNG")
-                    f.write(buf.getvalue())
-                
-                if mode == "2dgs":
-                    save_ply_2d(f"{ply_dir}/room_splats_{i:04d}.ply", curr_gaussians) 
-                else:
-                    save_ply(f"{ply_dir}/room_splats_{i:04d}.ply", curr_gaussians) 
+    # Background executor for I/O and rendering
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    futures = []
+
+    for b in pbar:
+        # Compiled training block
+        curr_state, curr_rng, losses = train_block(
+            curr_state, curr_rng, all_targets, all_w2cs, 
+            steps_per_block, camera_static, optimizer, use_pallas, backend
+        )
+        
+        avg_loss = jnp.mean(losses)
+        pbar.set_description(f"Loss: {avg_loss:.4f}")
+        
+        curr_iter = (b + 1) * steps_per_block
+        
+        if curr_iter % 1000 == 0:
+            # Capture state for background task
+            snap_gaussians = curr_state[0]
+            
+            # Submit background task
+            fut = executor.submit(
+                save_artifacts_task, 
+                snap_gaussians, curr_iter, progress_dir, ply_dir, 
+                jax_cameras[0], use_pallas, backend, mode
+            )
+            futures.append(fut)
+            
+            # Keep only the last few futures to avoid memory pressure
+            futures = [f for f in futures if not f.done()]
 
     # Final Save
-    print("Training done. Saving final model...")
-    final_gaussians = state[0]
-    if num_devices > 1:
-        final_gaussians = jax.tree_util.tree_map(lambda x: x[0], final_gaussians)
+    print("Waiting for background tasks to complete...")
+    concurrent.futures.wait(futures)
+    executor.shutdown()
 
-    if mode == "2dgs":
-        save_ply_2d(f"{output_dir}/room_final.ply", final_gaussians)
-    else:
-        save_ply(f"{output_dir}/room_final.ply", final_gaussians)
+    print("Training done. Saving final model...")
+    save_ply(f"{output_dir}/room_final.ply", curr_state[0])
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num_iterations", type=int, default=10000)
+    parser.add_argument("--num_iterations", type=int, default=30000)
     parser.add_argument("--mode", type=str, default="3dgs", choices=["3dgs", "2dgs"])
     parser.add_argument("--data_path", type=str, default="gs://dataset-nerf/nerf_llff_data/room")
     parser.add_argument("--output_path", type=str, default="gs://dataset-nerf/results")
     parser.add_argument("--use_pallas", action="store_true", help="Use Pallas kernels for rasterization")
-    parser.add_argument("--backend", type=str, default="gpu", choices=["gpu", "tpu"])
+    parser.add_argument("--backend", type=str, default="tpu", choices=["gpu", "tpu"])
     args = parser.parse_args()
     
     run_training(num_iterations=args.num_iterations, mode=args.mode, 
