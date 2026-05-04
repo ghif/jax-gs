@@ -50,7 +50,7 @@ def test_benchmark_renderer(use_pallas=False, backend="gpu"):
             W2C=W2C,
             full_proj=full_proj
         )
-        return render(gaussians, curr_cam, use_pallas=use_pallas, backend=backend)
+        return render(gaussians, curr_cam, fast_tpu_rasterizer=(backend == "tpu"))
     
     # JIT Warm-up
     print("Warming up (JIT)...")

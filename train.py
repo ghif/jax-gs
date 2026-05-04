@@ -14,11 +14,15 @@ from functools import partial
 import concurrent.futures
 
 from jax_gs.io.colmap import load_colmap_dataset
+from jax_gs.core.gaussians import init_gaussians_from_pcd
+from jax_gs.io.ply import save_ply
+from jax_gs.training.trainer import train_step
+from jax_gs.renderer.renderer import render
 
-def save_artifacts_task(gaussians, iteration, progress_dir, ply_dir, camera, use_pallas, backend, mode, scene_name, render_fn, save_ply_fn):
+def save_artifacts_task(gaussians, iteration, progress_dir, ply_dir, camera, fast_tpu_rasterizer, scene_name, render_fn, save_ply_fn):
     """Task to be run in a background thread."""
     # Trigger render (async on TPU)
-    img, _ = render_fn(gaussians, camera, use_pallas=use_pallas, backend=backend)
+    img, _ = render_fn(gaussians, camera, fast_tpu_rasterizer=fast_tpu_rasterizer)
     
     # Materialize image to host (blocks thread, but not main training loop)
     img_np = np.array(img)
@@ -34,33 +38,21 @@ def save_artifacts_task(gaussians, iteration, progress_dir, ply_dir, camera, use
     # Save PLY (materializes Gaussians to host)
     save_ply_fn(f"{ply_dir}/{scene_name}_splats_{iteration:04d}.ply", gaussians)
 
-def run_training(num_iterations: int = 30000, mode: str = "3dgs", 
+def run_training(num_iterations: int = 30000,
                  data_path: str = "gs://dataset-nerf/nerf_llff_data/fern",
                  output_base: str = "gs://dataset-nerf/results",
-                 use_pallas: bool = False,
-                 backend: str = "tpu",
+                 fast_tpu_rasterizer: bool = False,
                  images_subdir: str = "images_8"):
     
     # Infer scene name from path
     scene_name = os.path.basename(data_path.rstrip('/'))
-    print(f"Training on scene: {scene_name} (mode: {mode})")
+    print(f"Training on scene: {scene_name} (mode: 3dgs)")
+    print(f"Fast TPU Rasterizer: {fast_tpu_rasterizer}")
 
-    # Conditional logic based on mode (Dependency Injection)
-    if mode == "2dgs":
-        from jax_2dgs.core.gaussians_2d import init_gaussians_2d_from_pcd
-        from jax_2dgs.io.ply import save_ply_2d as save_ply
-        from jax_2dgs.training.trainer import train_step
-        from jax_2dgs.renderer.renderer import render
-        init_fn = init_gaussians_2d_from_pcd
-    else:
-        from jax_gs.core.gaussians import init_gaussians_from_pcd
-        from jax_gs.io.ply import save_ply
-        from jax_gs.training.trainer import train_step
-        from jax_gs.renderer.renderer import render
-        init_fn = init_gaussians_from_pcd
+    init_fn = init_gaussians_from_pcd
 
-    @partial(jax.jit, static_argnums=(4, 5, 6, 7, 8))
-    def train_block(state, rng_key, all_targets, all_w2cs, steps_per_block, camera_static, optimizer, use_pallas, backend):
+    @partial(jax.jit, static_argnums=(4, 5, 6, 7))
+    def train_block(state, rng_key, all_targets, all_w2cs, steps_per_block, camera_static, optimizer, fast_tpu_rasterizer):
         def one_step(carry, _):
             state, key = carry
             key, subkey = jax.random.split(key)
@@ -71,7 +63,7 @@ def run_training(num_iterations: int = 30000, mode: str = "3dgs",
             w2c = all_w2cs[idx]
             
             # Perform training step
-            state, loss, metrics = train_step(state, target, w2c, camera_static, optimizer, use_pallas, backend)
+            state, loss, metrics = train_step(state, target, w2c, camera_static, optimizer, fast_tpu_rasterizer=fast_tpu_rasterizer)
             
             return (state, key), loss
 
@@ -101,7 +93,8 @@ def run_training(num_iterations: int = 30000, mode: str = "3dgs",
     
     # 5. Training Loop
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = f"{output_base}/{scene_name}_{mode}_{timestamp}"
+    rasterizer_suffix = "_fast_tpu" if fast_tpu_rasterizer else ""
+    output_dir = f"{output_base}/{scene_name}_3dgs{rasterizer_suffix}_{timestamp}"
     
     fs, _ = fsspec.core.url_to_fs(output_dir)
     if fs.protocol == 'file' or (isinstance(fs.protocol, (list, tuple)) and 'file' in fs.protocol):
@@ -133,7 +126,7 @@ def run_training(num_iterations: int = 30000, mode: str = "3dgs",
         # Compiled training block
         curr_state, curr_rng, losses = train_block(
             curr_state, curr_rng, all_targets, all_w2cs, 
-            steps_per_block, camera_static, optimizer, use_pallas, backend
+            steps_per_block, camera_static, optimizer, fast_tpu_rasterizer
         )
         
         avg_loss = jnp.mean(losses)
@@ -149,7 +142,7 @@ def run_training(num_iterations: int = 30000, mode: str = "3dgs",
             fut = executor.submit(
                 save_artifacts_task, 
                 snap_gaussians, curr_iter, progress_dir, ply_dir, 
-                jax_cameras[0], use_pallas, backend, mode, scene_name, render, save_ply
+                jax_cameras[0], fast_tpu_rasterizer, scene_name, render, save_ply
             )
             futures.append(fut)
             
@@ -167,15 +160,14 @@ def run_training(num_iterations: int = 30000, mode: str = "3dgs",
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--num_iterations", type=int, default=30000)
-    parser.add_argument("--mode", type=str, default="3dgs", choices=["3dgs", "2dgs"])
     parser.add_argument("--data_path", type=str, default="gs://dataset-nerf/nerf_llff_data/fern")
     parser.add_argument("--output_path", type=str, default="gs://dataset-nerf/results")
     parser.add_argument("--images_subdir", type=str, default="images_8")
-    parser.add_argument("--use_pallas", action="store_true", help="Use Pallas kernels for rasterization")
-    parser.add_argument("--backend", type=str, default="tpu", choices=["gpu", "tpu"])
+    parser.add_argument("--fast_tpu_rasterizer", action="store_true", help="Use the optimized JAX scan rasterizer for TPU")
     args = parser.parse_args()
     
-    run_training(num_iterations=args.num_iterations, mode=args.mode, 
+    run_training(num_iterations=args.num_iterations, 
                  data_path=args.data_path, output_base=args.output_path,
-                 use_pallas=args.use_pallas, backend=args.backend,
+                 fast_tpu_rasterizer=args.fast_tpu_rasterizer,
                  images_subdir=args.images_subdir)
+

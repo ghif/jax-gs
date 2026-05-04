@@ -37,7 +37,8 @@ def project_gaussians(gaussians: Gaussians, camera: Camera):
     # Jacobian of the perspective transformation
     # J = [fx/z, 0, -fx*x/z^2]
     #     [0, fy/z, -fy*y/z^2]
-    inv_z = 1.0 / z
+    safe_z = jnp.maximum(z, 0.01)
+    inv_z = 1.0 / safe_z
     inv_z2 = inv_z**2
     
     J = jnp.stack([

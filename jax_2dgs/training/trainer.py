@@ -7,7 +7,7 @@ from jax_2dgs.training.losses import depth_distortion_loss, normal_consistency_l
 from jax_gs.core.camera import Camera
 import jax.numpy as jnp
 
-def train_step_internal(state, target_image, w2c, camera_static, optimizer, use_pallas=False, backend="gpu"):
+def train_step_internal(state, target_image, w2c, camera_static, optimizer):
     """
     Internal training step for 2DGS, suitable for use inside scan/pmap.
     """
@@ -22,7 +22,7 @@ def train_step_internal(state, target_image, w2c, camera_static, optimizer, use_
     lambda_normal = 0.0001
 
     def loss_fn(p):
-        image, extras = render(p, camera, use_pallas=use_pallas, backend=backend)
+        image, extras = render(p, camera)
         l1 = l1_loss(image, target_image)
         d_ssim = d_ssim_loss(image, target_image)
 
@@ -64,8 +64,8 @@ def train_step_internal(state, target_image, w2c, camera_static, optimizer, use_
     
     return (next_params, next_opt_state), loss, metrics
 
-@partial(jax.jit, static_argnums=(3, 4, 5, 6))
-def train_step(state, target_image, w2c, camera_static, optimizer, use_pallas=False, backend="gpu"):
+@partial(jax.jit, static_argnums=(3, 4))
+def train_step(state, target_image, w2c, camera_static, optimizer):
     """
     Standard training step for 2DGS.
     Args:
@@ -74,8 +74,6 @@ def train_step(state, target_image, w2c, camera_static, optimizer, use_pallas=Fa
         w2c: (4, 4)
         camera_static: (W, H, fx, fy, cx, cy)
         optimizer: optax optimizer
-        use_pallas: Use Pallas backend for rasterization
-        backend: Accelerator backend for Pallas (gpu or tpu)
     Returns:
         (next_params, next_opt_state), loss, metrics
     """
@@ -90,7 +88,7 @@ def train_step(state, target_image, w2c, camera_static, optimizer, use_pallas=Fa
     lambda_normal = 0.0001
 
     def loss_fn(p):
-        image, extras = render(p, camera, use_pallas=use_pallas, backend=backend)
+        image, extras = render(p, camera)
         l1 = l1_loss(image, target_image)
         d_ssim = d_ssim_loss(image, target_image)
 

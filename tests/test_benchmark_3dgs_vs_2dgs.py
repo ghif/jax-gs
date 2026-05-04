@@ -6,9 +6,10 @@ import os
 import pytest
 import numpy as np
 from jax_gs.core.gaussians import init_gaussians_from_pcd
-from jax_gs.core.gaussians_2d import init_gaussians_2d_from_pcd
+from jax_2dgs.core.gaussians_2d import init_gaussians_2d_from_pcd
 from jax_gs.io.colmap import load_colmap_dataset
-from jax_gs.renderer.renderer import render
+from jax_gs.renderer.renderer import render as render_3d
+from jax_2dgs.renderer.renderer import render as render_2d
 from jax_gs.training.trainer import train_step
 
 def load_fern():
@@ -23,19 +24,21 @@ def benchmark_renderer(mode: str, xyz, rgb, jax_cameras):
     camera = jax_cameras[0]
     if mode == "2dgs":
         gaussians = init_gaussians_2d_from_pcd(jnp.array(xyz), jnp.array(rgb))
+        render_fn = render_2d
     else:
         gaussians = init_gaussians_from_pcd(jnp.array(xyz), jnp.array(rgb))
+        render_fn = render_3d
     
     # Warmup
     print(f"Warmup {mode} renderer...")
-    image, _ = render(gaussians, camera, mode=mode)
+    image, _ = render_fn(gaussians, camera)
     jax.block_until_ready(image)
     
     # Benchmark
     num_runs = 50
     start = time.perf_counter()
     for _ in range(num_runs):
-        image, _ = render(gaussians, camera, mode=mode)
+        image, _ = render_fn(gaussians, camera)
         jax.block_until_ready(image)
     end = time.perf_counter()
     
@@ -46,8 +49,10 @@ def benchmark_training(mode: str, xyz, rgb, jax_cameras, jax_targets):
     camera = jax_cameras[0]
     target = jax_targets[0]
     if mode == "2dgs":
+        from jax_2dgs.training.trainer import train_step as train_step_fn
         gaussians = init_gaussians_2d_from_pcd(jnp.array(xyz), jnp.array(rgb))
     else:
+        from jax_gs.training.trainer import train_step as train_step_fn
         gaussians = init_gaussians_from_pcd(jnp.array(xyz), jnp.array(rgb))
         
     optimizer = optax.adam(learning_rate=1e-3)
@@ -57,14 +62,14 @@ def benchmark_training(mode: str, xyz, rgb, jax_cameras, jax_targets):
     
     # Warmup
     print(f"Warmup {mode} training step...")
-    state, loss, metrics = train_step(state, target, camera.W2C, camera_static, optimizer, mode=mode)
+    state, loss, metrics = train_step_fn(state, target, camera.W2C, camera_static, optimizer)
     jax.block_until_ready(loss)
     
     # Benchmark
     num_runs = 50
     start = time.perf_counter()
     for _ in range(num_runs):
-        state, loss, metrics = train_step(state, target, camera.W2C, camera_static, optimizer, mode=mode)
+        state, loss, metrics = train_step_fn(state, target, camera.W2C, camera_static, optimizer)
         jax.block_until_ready(loss)
     end = time.perf_counter()
     
