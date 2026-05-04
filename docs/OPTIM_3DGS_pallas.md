@@ -30,12 +30,17 @@ The core of the acceleration lies in the backward kernel, which reverses the for
 *   **Reverse Iteration:** The kernel iterates through the sorted Gaussians in *reverse* order (from back to front) to maintain correct gradient bookkeeping.
 *   **Atomic Aggregation:** Because multiple tiles might influence the same Gaussian, the kernel will use `atomic_add` to update the global gradient buffers for Gaussian means, scales, rotations, and opacities.
 
-#### 2. TPU (Mosaic) Optimization
-*   **VMEM Buffering:** Since TPUs lack efficient global hardware atomics, the kernel will write gradients to a tile-specific buffer in HBM.
-*   **Vectorized Gradients:** The kernel will process 128-float or 256-float vectors to maximize MXU/VPU utilization during the gradient calculation.
-*   **Two-Pass Reduction:**
-    1.  **Kernel Pass:** Compute and store gradients per-tile per-Gaussian.
-    2.  **JAX Pass:** Use `jax.lax.segment_sum` or a similar highly-optimized XLA primitive to aggregate these per-tile gradients into the final global gradient array.
+#### 2. TPU (Mosaic) Optimization (Revised)
+Based on empirical benchmarking, custom Mosaic TPU kernels for 3DGS rasterization are extremely brittle and suffer from severe performance bottlenecks (e.g., 0.02x speedup vs. standard JAX) due to strict constraints on memory layouts, 128-element alignment, and unsupported vector.multi_reduction operations over custom block shapes.
+
+The new strategy for TPU optimization shifts away from writing manual Mosaic kernels to leveraging XLA's highly optimized compiler on structured JAX code:
+
+*   **Abandon Hand-Written Mosaic Kernels:** Remove the failing rasterize_kernel_tpu and rasterize_bwd_kernel_tpu implementations. They are opaque to the XLA compiler's layout optimization passes, resulting in unoptimized memory access patterns and compilation crashes.
+*   **Fully Vectorized Pure JAX:** Rewrite the core rasterization logic using standard XLA-friendly JAX primitives. XLA on TPU excels at compiling large blocks of vmap, scan, and matmul operations.
+*   **Tile-Based Parallelism via vmap and scan:** 
+    *   Pre-sort and chunk Gaussians per tile.
+    *   Use jax.vmap over tiles and jax.lax.scan over the chunked Gaussians within each tile. XLA can fuse these loops and map them efficiently to the TPU's matrix multiplier units (MXUs) and vector processing units (VPUs) without manual block layout specification.
+*   **Avoid Dynamic Indexing in Inner Loops:** The previous Pallas implementations relied heavily on manual gather/scatter indexing inside the kernel. The revised pure JAX approach must use fixed-size arrays and padding to ensure XLA can statically prove memory alignment, avoiding XLA layout alignment errors observed previously.
 
 ### C. Checkpointing & Recomputation
 To balance memory usage and speed:
