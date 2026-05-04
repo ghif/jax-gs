@@ -85,7 +85,12 @@ def run_parallel_training(num_iterations: int = 30000,
     gaussians = init_fn(np.array(xyz), np.array(rgb))
     
     # 3. Setup Optimizer
-    optimizer = optax.adam(learning_rate=1e-3)
+    # Scale learning rate linearly with the number of devices to maintain convergence 
+    # dynamics given the larger effective batch size (pmean).
+    base_lr = 1e-3
+    scaled_lr = base_lr * num_devices
+    print(f"Scaling learning rate to {scaled_lr} (Base: {base_lr} * {num_devices} devices)")
+    optimizer = optax.adam(learning_rate=scaled_lr)
     opt_state = optimizer.init(gaussians)
     state = (gaussians, opt_state)
     
@@ -123,9 +128,19 @@ def run_parallel_training(num_iterations: int = 30000,
         os.makedirs(progress_dir, exist_ok=True)
         os.makedirs(ply_dir, exist_ok=True)
 
-    steps_per_block = 500
-    num_blocks = num_iterations // steps_per_block
+    # Adjust steps per block so the effective number of iterations 
+    # (devices * steps) roughly matches the single-device behavior per block.
+    base_steps_per_block = 500
+    steps_per_block = max(1, base_steps_per_block // num_devices)
     
+    # Adjust total blocks so total effective iterations matches target
+    effective_iterations_per_block = steps_per_block * num_devices
+    num_blocks = num_iterations // effective_iterations_per_block
+    
+    print(f"Total target iterations: {num_iterations}")
+    print(f"Executing {num_blocks} blocks of {steps_per_block} steps per device.")
+    print(f"({effective_iterations_per_block} effective iterations per block)")
+
     pbar = tqdm(range(num_blocks))
     
     cam0 = jax_cameras[0]
@@ -148,22 +163,24 @@ def run_parallel_training(num_iterations: int = 30000,
         avg_loss = jnp.mean(losses[0])
         pbar.set_description(f"Loss: {avg_loss:.4f}")
         
-        curr_iter = (b + 1) * steps_per_block
+        # Track by effective iterations
+        curr_effective_iter = (b + 1) * effective_iterations_per_block
         
-        if curr_iter % 1000 == 0:
+        if curr_effective_iter % 1000 == 0 or b == num_blocks - 1:
             # Capture state for background task
             snap_gaussians = jax.tree_util.tree_map(lambda x: x[0], curr_state[0])
             
             # Submit background task (inject render and save_ply functions)
             fut = executor.submit(
                 save_artifacts_task, 
-                snap_gaussians, curr_iter, progress_dir, ply_dir, 
+                snap_gaussians, curr_effective_iter, progress_dir, ply_dir, 
                 jax_cameras[0], fast_tpu_rasterizer, scene_name, render, save_ply
             )
             futures.append(fut)
             
             # Keep only the last few futures to avoid memory pressure
             futures = [f for f in futures if not f.done()]
+
 
     # Final Save
     print("Waiting for background tasks to complete...")
