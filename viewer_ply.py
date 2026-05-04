@@ -3,6 +3,8 @@ This script provides a simple 3D point cloud viewer for PLY files using the Vise
 It loads point cloud data (coordinates and optionally colors) from a specified .ply file
 and renders it in a web-based interactive viewer.
 
+NOTE: This script is exclusively for 3D Gaussian Splatting (3DGS) outputs.
+It parses scale_0, scale_1, scale_2 and constructs 3x3 covariance matrices.
 """
 import viser
 import time

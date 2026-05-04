@@ -95,6 +95,12 @@ def init_gaussians_2d_from_pcd(points: jnp.ndarray, colors: jnp.ndarray):
     # Opacities: inverse sigmoid of 0.5 = 0.0
     opacities = jnp.full((num_points, 1), 0.0) 
     
+    # Handle missing colors in some point clouds (e.g. from LLFF datasets like 'room')
+    # If the maximum color value is practically zero, initialize with random colors.
+    colors = jnp.where(jnp.max(colors) < 1e-3,
+                       jax.random.uniform(jax.random.PRNGKey(42), colors.shape, minval=0.1, maxval=0.9),
+                       colors)
+    
     # SH Coefficients (DC term only)
     sh_dc = (colors - 0.5) / 0.28209479177387814
     sh_coeffs = jnp.zeros((num_points, 16, 3)) # Degree 3 SH -> 16 coefficients
