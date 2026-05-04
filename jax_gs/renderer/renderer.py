@@ -4,14 +4,8 @@ from jax_gs.core.camera import Camera
 from jax_gs.renderer.projection import project_gaussians
 from jax_gs.renderer.rasterizer import get_tile_interactions, render_tiles, TILE_SIZE
 
-try:
-    from jax_gs.renderer.rasterizer_pallas import render_tiles_pallas
-    HAS_PALLAS = True
-except ImportError:
-    HAS_PALLAS = False
-
 def render(gaussians: Gaussians, camera: Camera, background=jnp.array([0.0, 0.0, 0.0]), 
-           use_pallas: bool = False, backend: str = "gpu"):
+           fast_tpu_rasterizer: bool = False):
     """
     Main entry point for rendering.
 
@@ -19,8 +13,7 @@ def render(gaussians: Gaussians, camera: Camera, background=jnp.array([0.0, 0.0,
         gaussians: Gaussians dataclass
         camera: Camera dataclass
         background: Background color
-        use_pallas: Use Pallas backend
-        backend: Accelerator backend for Pallas (gpu or tpu)
+        fast_tpu_rasterizer: Use optimized JAX scan rasterizer for TPU
     Returns:
         image: Rendered image
         extras: Optional dictionary with auxiliary maps (depth, normals, etc.)
@@ -38,23 +31,14 @@ def render(gaussians: Gaussians, camera: Camera, background=jnp.array([0.0, 0.0,
     )
     
     # 3. Rasterize tiles
-    if use_pallas and HAS_PALLAS:
-        if backend == "tpu":
-            from jax_gs.renderer.rasterizer_tpu import render_tiles_tpu
-            image = render_tiles_tpu(
-                means2D, cov2D, gaussians.opacities, colors,
-                sorted_tile_ids, sorted_gaussian_ids,
-                camera.H, camera.W, background
-            )
-            extras = {}
-        else:
-            # Rasterize tiles using Pallas GPU kernel
-            image, extras = render_tiles_pallas(
-                means2D, cov2D, gaussians.opacities, colors,
-                sorted_tile_ids, sorted_gaussian_ids,
-                camera.H, camera.W, TILE_SIZE, background,
-                backend=backend
-            )
+    if fast_tpu_rasterizer:
+        from jax_gs.renderer.rasterizer_tpu import render_tiles_tpu
+        image = render_tiles_tpu(
+            means2D, cov2D, gaussians.opacities, colors,
+            sorted_tile_ids, sorted_gaussian_ids,
+            camera.H, camera.W, background
+        )
+        extras = {}
     else:
         # Rasterize tiles using pure JAX standard implementation
         image = render_tiles(

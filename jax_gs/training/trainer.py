@@ -6,7 +6,7 @@ from jax_gs.training.losses import l1_loss, d_ssim_loss
 from jax_gs.core.camera import Camera
 import jax.numpy as jnp
 
-def _compute_loss_and_metrics(params, target_image, w2c, camera_static, use_pallas, backend):
+def _compute_loss_and_metrics(params, target_image, w2c, camera_static, fast_tpu_rasterizer):
     """
     Common loss computation logic for 3DGS.
     """
@@ -15,7 +15,7 @@ def _compute_loss_and_metrics(params, target_image, w2c, camera_static, use_pall
     
     lambda_ssim = 0.2
     
-    image, extras = render(params, camera, use_pallas=use_pallas, backend=backend)
+    image, extras = render(params, camera, fast_tpu_rasterizer=fast_tpu_rasterizer)
     l1 = l1_loss(image, target_image)
     d_ssim = d_ssim_loss(image, target_image)
 
@@ -28,7 +28,7 @@ def _compute_loss_and_metrics(params, target_image, w2c, camera_static, use_pall
 
     return total_loss, metrics
 
-def train_step_internal(state, target_image, w2c, camera_static, optimizer, use_pallas=False, backend="gpu"):
+def train_step_internal(state, target_image, w2c, camera_static, optimizer, fast_tpu_rasterizer=False):
     """
     Internal training step for 3DGS, suitable for use inside scan/pmap.
     Expects to be called within a pmap with axis_name='batch'.
@@ -36,7 +36,7 @@ def train_step_internal(state, target_image, w2c, camera_static, optimizer, use_
     params, opt_state = state
     
     def loss_fn(p):
-        return _compute_loss_and_metrics(p, target_image, w2c, camera_static, use_pallas, backend)
+        return _compute_loss_and_metrics(p, target_image, w2c, camera_static, fast_tpu_rasterizer)
     
     (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
     
@@ -52,15 +52,15 @@ def train_step_internal(state, target_image, w2c, camera_static, optimizer, use_
     
     return (next_params, next_opt_state), loss, metrics
 
-@partial(jax.jit, static_argnums=(3, 4, 5, 6))
-def train_step(state, target_image, w2c, camera_static, optimizer, use_pallas=False, backend="gpu"):
+@partial(jax.jit, static_argnums=(3, 4, 5))
+def train_step(state, target_image, w2c, camera_static, optimizer, fast_tpu_rasterizer=False):
     """
     Standard single-device training step for 3DGS.
     """
     params, opt_state = state
     
     def loss_fn(p):
-        return _compute_loss_and_metrics(p, target_image, w2c, camera_static, use_pallas, backend)
+        return _compute_loss_and_metrics(p, target_image, w2c, camera_static, fast_tpu_rasterizer)
     
     (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
     updates, next_opt_state = optimizer.update(grads, opt_state, params)
