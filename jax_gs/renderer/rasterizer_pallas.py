@@ -97,82 +97,6 @@ def rasterize_kernel_gpu(
     out_grid_ref[...] = jnp.nan_to_num(final_data)
 
 
-def rasterize_kernel_tpu(
-    g_means_ref, g_icov_ref, g_ops_ref, g_cols_ref, g_depths_ref, g_normals_ref, g_mask_ref, 
-    background_ref, out_grid_ref,
-    *, W, H, is_2dgs
-):
-    """
-    Optimized Pallas kernel for TPU (Mosaic).
-    """
-    ty, tx = pl.program_id(0), pl.program_id(1)
-    pix_min_x = (tx * TILE_SIZE).astype(jnp.float32) + 0.5
-    pix_min_y = (ty * TILE_SIZE).astype(jnp.float32) + 0.5
-    
-    flat_idx = jnp.arange(TILE_SIZE * TILE_SIZE, dtype=jnp.int32)
-    grid_x = pix_min_x + (flat_idx % TILE_SIZE).astype(jnp.float32)
-    grid_y = pix_min_y + (flat_idx // TILE_SIZE).astype(jnp.float32)
-
-    c0_accum = jnp.zeros((256,), dtype=jnp.float32)
-    c1_accum = jnp.zeros((256,), dtype=jnp.float32)
-    c2_accum = jnp.zeros((256,), dtype=jnp.float32)
-    T = jnp.ones((256,), dtype=jnp.float32)
-    
-    d_accum = jnp.zeros((256,), dtype=jnp.float32)
-    d2_accum = jnp.zeros((256,), dtype=jnp.float32)
-    n0_accum = jnp.zeros((256,), dtype=jnp.float32)
-    n1_accum = jnp.zeros((256,), dtype=jnp.float32)
-    n2_accum = jnp.zeros((256,), dtype=jnp.float32)
-
-    CHUNK_SIZE = 16
-    num_chunks = BLOCK_SIZE // CHUNK_SIZE
-
-    for chunk_idx in range(num_chunks):
-        curr_start = chunk_idx * CHUNK_SIZE
-        mu_chunk = g_means_ref[pl.ds(curr_start, CHUNK_SIZE), :]
-        icov_chunk = g_icov_ref[pl.ds(curr_start, CHUNK_SIZE), :]
-        op_chunk = g_ops_ref[pl.ds(curr_start, CHUNK_SIZE), 0]
-        col_chunk = g_cols_ref[pl.ds(curr_start, CHUNK_SIZE), :]
-        mask_chunk = g_mask_ref[pl.ds(curr_start, CHUNK_SIZE), 0]
-        
-        if is_2dgs:
-            depth_chunk = g_depths_ref[pl.ds(curr_start, CHUNK_SIZE), 0]
-            norm_chunk = g_normals_ref[pl.ds(curr_start, CHUNK_SIZE), :]
-
-        for l in range(CHUNK_SIZE):
-            mu_x, mu_y = mu_chunk[l, 0], mu_chunk[l, 1]
-            icov_00, icov_01, icov_11 = icov_chunk[l, 0], icov_chunk[l, 1], icov_chunk[l, 3]
-            op, mask = op_chunk[l], mask_chunk[l].astype(bool)
-
-            dx, dy = grid_x - mu_x, grid_y - mu_y
-            power = -0.5 * (dx * dx * icov_00 + dx * dy * 2.0 * icov_01 + dy * dy * icov_11)
-            alpha = jnp.exp(jnp.clip(power, -100.0, 0.0)) * op
-            is_active = mask & (power > -10.0) & (grid_x < W) & (grid_y < H) & (T > 1e-4)
-            alpha = jnp.where(is_active, jnp.minimum(0.99, alpha), 0.0)
-
-            weight = alpha * T
-            c0_accum = c0_accum + weight * col_chunk[l, 0]
-            c1_accum = c1_accum + weight * col_chunk[l, 1]
-            c2_accum = c2_accum + weight * col_chunk[l, 2]
-            
-            if is_2dgs:
-                d = depth_chunk[l]
-                d_accum = d_accum + weight * d
-                d2_accum = d2_accum + weight * (d * d)
-                n0_accum = n0_accum + weight * norm_chunk[l, 0]
-                n1_accum = n1_accum + weight * norm_chunk[l, 1]
-                n2_accum = n2_accum + weight * norm_chunk[l, 2]
-
-            T = T * (1.0 - alpha)
-
-    bg = background_ref[...]
-    c0_accum, c1_accum, c2_accum = c0_accum + T * bg[0], c1_accum + T * bg[1], c2_accum + T * bg[2]
-
-    if is_2dgs:
-        final_color = jnp.stack([c0_accum, c1_accum, c2_accum, d_accum, d2_accum, n0_accum, n1_accum, n2_accum, 1.0 - T], axis=-1).reshape(TILE_SIZE, TILE_SIZE, 9)
-    else:
-        final_color = jnp.stack([c0_accum, c1_accum, c2_accum, 1.0 - T], axis=-1).reshape(TILE_SIZE, TILE_SIZE, 4)
-    out_grid_ref[...] = jnp.nan_to_num(final_color)
 def rasterize_backward_kernel_tile(
     g_means_ref, g_icov_ref, g_ops_ref, g_cols_ref, g_valid_ref,
     final_T_ref, dimage_ref, background_ref,
@@ -314,39 +238,7 @@ def _run_forward_pallas(prepared, H, W, background, is_2dgs, backend):
     is_cpu = jax.devices()[0].platform == "cpu"
 
     if backend == "tpu":
-        all_tile_indices = tile_boundaries[:-1, None] + jnp.arange(BLOCK_SIZE)[None, :]
-        max_idx = jnp.maximum(prepared["valid_ids"].shape[0] - 1, 0)
-        all_tile_indices = jnp.clip(all_tile_indices, 0, max_idx)
-
-        g_means = means2D_sorted[all_tile_indices].reshape(num_tiles_y, num_tiles_x, BLOCK_SIZE, 2)
-        g_icov = inv_cov2D_sorted[all_tile_indices].reshape(num_tiles_y, num_tiles_x, BLOCK_SIZE, 4)
-        g_ops = opacities_sorted[all_tile_indices].reshape(num_tiles_y, num_tiles_x, BLOCK_SIZE, 1)
-        g_cols = colors_sorted[all_tile_indices].reshape(num_tiles_y, num_tiles_x, BLOCK_SIZE, 3)
-        g_depths = depths_sorted[all_tile_indices].reshape(num_tiles_y, num_tiles_x, BLOCK_SIZE, 1)
-        g_normals = normals_sorted[all_tile_indices].reshape(num_tiles_y, num_tiles_x, BLOCK_SIZE, 3)
-
-        tile_counts = tile_boundaries[1:] - tile_boundaries[:-1]
-        g_mask = (jnp.arange(BLOCK_SIZE)[None, :] < tile_counts[:, None]).astype(jnp.float32).reshape(num_tiles_y, num_tiles_x, BLOCK_SIZE, 1)
-
-        in_specs = [
-            pl.BlockSpec((None, None, BLOCK_SIZE, 2), lambda ty, tx: (ty, tx, 0, 0)),
-            pl.BlockSpec((None, None, BLOCK_SIZE, 4), lambda ty, tx: (ty, tx, 0, 0)),
-            pl.BlockSpec((None, None, BLOCK_SIZE, 1), lambda ty, tx: (ty, tx, 0, 0)),
-            pl.BlockSpec((None, None, BLOCK_SIZE, 3), lambda ty, tx: (ty, tx, 0, 0)),
-            pl.BlockSpec((None, None, BLOCK_SIZE, 1), lambda ty, tx: (ty, tx, 0, 0)),
-            pl.BlockSpec((None, None, BLOCK_SIZE, 3), lambda ty, tx: (ty, tx, 0, 0)),
-            pl.BlockSpec((None, None, BLOCK_SIZE, 1), lambda ty, tx: (ty, tx, 0, 0)),
-            pl.BlockSpec(),
-        ]
-
-        return pl.pallas_call(
-            partial(rasterize_kernel_tpu, W=float(W), H=float(H), is_2dgs=is_2dgs),
-            out_shape=out_shape,
-            grid=(num_tiles_y, num_tiles_x),
-            in_specs=in_specs,
-            out_specs=out_specs,
-            interpret=is_cpu,
-        )(g_means, g_icov, g_ops, g_cols, g_depths, g_normals, g_mask, background)
+        raise NotImplementedError("TPU Pallas kernel removed. Use standard JAX implementation.")
 
     return pl.pallas_call(
         partial(rasterize_kernel_gpu, num_tiles_x=num_tiles_x, W=float(W), H=float(H), is_2dgs=is_2dgs),
@@ -517,27 +409,7 @@ def _render_tiles_pallas_3dgs_gpu_bwd(res, g_image):
 
 _render_tiles_pallas_3dgs_gpu.defvjp(_render_tiles_pallas_3dgs_gpu_fwd, _render_tiles_pallas_3dgs_gpu_bwd)
 
-@jax.custom_vjp
-def _render_tiles_pallas_3dgs_tpu(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaussian_ids, H, W, background):
-    image, _, _, _ = _render_tiles_pallas_3dgs_impl(
-        means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaussian_ids, H, W, background, backend="tpu"
-    )
-    return image
 
-def _render_tiles_pallas_3dgs_tpu_fwd(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaussian_ids, H, W, background):
-    image, final_T, tile_boundaries, valid_ids = _render_tiles_pallas_3dgs_impl(
-        means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaussian_ids, H, W, background, backend="tpu"
-    )
-    res = (
-        means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaussian_ids,
-        H, W, background, final_T, tile_boundaries, valid_ids
-    )
-    return image, res
-
-def _render_tiles_pallas_3dgs_tpu_bwd(res, g_image):
-    return _render_tiles_pallas_3dgs_bwd_impl(res, g_image, backend="tpu")
-
-_render_tiles_pallas_3dgs_tpu.defvjp(_render_tiles_pallas_3dgs_tpu_fwd, _render_tiles_pallas_3dgs_tpu_bwd)
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6, 7, 8, 10, 11, 12))

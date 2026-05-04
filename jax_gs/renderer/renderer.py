@@ -38,7 +38,8 @@ def render(gaussians: Gaussians, camera: Camera, background=jnp.array([0.0, 0.0,
     )
     
     # 3. Rasterize tiles
-    if use_pallas and HAS_PALLAS:
+    use_pallas_effective = use_pallas and HAS_PALLAS and backend == "gpu"
+    if use_pallas_effective:
         # Rasterize tiles using Pallas
         image, extras = render_tiles_pallas(
             means2D, cov2D, gaussians.opacities, colors,
