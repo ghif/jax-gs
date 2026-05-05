@@ -43,23 +43,26 @@ def test_train_step_execution():
     means = jnp.zeros((num_points, 3))
     colors = jnp.zeros((num_points, 3))
     gaussians = init_gaussians_from_pcd(means, colors)
-    
+
     optimizer = optax.adam(learning_rate=1e-3)
-    opt_state = optimizer.init(gaussians)
-    state = (gaussians, opt_state)
-    
+
+    from jax_gs.training.density import init_density_state
+    state = init_density_state(gaussians, optimizer, max_gaussians=20)
+
     # Mock data
     target_image = jnp.zeros((16, 16, 3))
     w2c = jnp.eye(4)
     camera_static = (16, 16, 10.0, 10.0, 8.0, 8.0) # W, H, fx, fy, cx, cy
-    
+
     # Run step
     new_state, loss, metrics = train_step(state, target_image, w2c, camera_static, optimizer)
-    
-    assert loss >= 0
-    assert len(new_state) == 2
+
+    assert new_state.gaussians.means.shape == state.gaussians.means.shape
+    assert isinstance(loss, jax.Array)
     assert "l1" in metrics
     assert "ssim" in metrics
     # Verify parameters changed (gradient flow)
-    # Since target is 0 and init is 0 (sigmoid(op) > 0), loss will be > 0 and params should update
-    assert not jnp.allclose(new_state[0].means, gaussians.means)
+    # Only active Gaussians should change
+    assert not jnp.allclose(new_state.gaussians.means[:num_points], state.gaussians.means[:num_points])
+    # Padded ones should remain exactly as initialized (0 for means)
+    assert jnp.allclose(new_state.gaussians.means[num_points:], state.gaussians.means[num_points:])

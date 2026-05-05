@@ -4,7 +4,7 @@ from typing import Tuple
 
 # Standard Constants
 TILE_SIZE = 16  # Each tile is 16x16 pixels
-BLOCK_SIZE = 192  # Maximum number of Gaussians processed per tile in a single pass
+BLOCK_SIZE = 512  # Increased from 192 to 512 to reduce blocky artifacts on datasets with high depth complexity
 
 def get_tile_interactions(means2D, radii, valid_mask, depths, H, W, tile_size: int = TILE_SIZE):
     """

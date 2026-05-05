@@ -7,6 +7,7 @@ import pytest
 from jax_gs.core.gaussians import init_gaussians_from_pcd
 from jax_gs.io.colmap import load_colmap_dataset
 from jax_gs.training.trainer import train_step
+from jax_gs.training.density import init_density_state
 
 def test_benchmark_training_fern():
     """
@@ -31,8 +32,9 @@ def test_benchmark_training_fern():
     # 2. Initialize Gaussians and Optimizer
     gaussians = init_gaussians_from_pcd(jnp.array(xyz), jnp.array(rgb))
     optimizer = optax.adam(learning_rate=1e-3)
-    opt_state = optimizer.init(gaussians)
-    state = (gaussians, opt_state)
+    
+    max_gaussians = min(2_000_000, num_points * 4)
+    state = init_density_state(gaussians, optimizer, max_gaussians)
     
     # Prepare static camera args
     camera_static = (camera.W, camera.H, camera.fx, camera.fy, camera.cx, camera.cy)

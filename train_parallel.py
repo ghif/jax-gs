@@ -18,6 +18,7 @@ from jax_gs.training.trainer import train_step_internal
 from jax_gs.core.gaussians import init_gaussians_from_pcd
 from jax_gs.io.ply import save_ply
 from jax_gs.renderer.renderer import render
+from jax_gs.training.density import init_density_state, densify_and_prune
 
 @partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(4, 5, 6, 7))
 def train_block(state, rng_key, all_targets, all_w2cs, steps_per_block, camera_static, optimizer, fast_tpu_rasterizer):
@@ -37,9 +38,16 @@ def train_block(state, rng_key, all_targets, all_w2cs, steps_per_block, camera_s
 
     (state, rng_key), losses = jax.lax.scan(one_step, (state, rng_key), None, length=steps_per_block)
     return state, rng_key, losses
+    
+@partial(jax.pmap, axis_name='batch')
+def pmap_density_step(state):
+    return densify_and_prune(state, extent=5.0)
 
-def save_artifacts_task(gaussians, iteration, progress_dir, ply_dir, camera, fast_tpu_rasterizer, scene_name, render_fn, save_ply_fn):
+def save_artifacts_task(gaussians_dict, iteration, progress_dir, ply_dir, camera, fast_tpu_rasterizer, scene_name, render_fn, save_ply_fn):
     """Task to be run in a background thread."""
+    from jax_gs.core.gaussians import Gaussians
+    gaussians = Gaussians(**gaussians_dict)
+    
     # Trigger render (async on TPU)
     img, _ = render_fn(gaussians, camera, fast_tpu_rasterizer=fast_tpu_rasterizer)
     
@@ -56,6 +64,18 @@ def save_artifacts_task(gaussians, iteration, progress_dir, ply_dir, camera, fas
     
     # Save PLY (materializes Gaussians to host)
     save_ply_fn(f"{ply_dir}/{scene_name}_splats_{iteration:04d}.ply", gaussians)
+
+def get_active_gaussians(state):
+    """Extracts only the active Gaussians into a host-side dictionary for saving."""
+    active = np.array(state.active_mask)
+    g = state.gaussians
+    return {
+        "means": np.array(g.means)[active],
+        "scales": np.array(g.scales)[active],
+        "quaternions": np.array(g.quaternions)[active],
+        "opacities": np.array(g.opacities)[active],
+        "sh_coeffs": np.array(g.sh_coeffs)[active]
+    }
 
 def run_parallel_training(num_iterations: int = 30000,
                           data_path: str = "gs://dataset-nerf/nerf_llff_data/fern",
@@ -84,15 +104,15 @@ def run_parallel_training(num_iterations: int = 30000,
     # 2. Initialize Gaussians
     gaussians = init_fn(np.array(xyz), np.array(rgb))
     
-    # 3. Setup Optimizer
-    # Scale learning rate linearly with the number of devices to maintain convergence 
-    # dynamics given the larger effective batch size (pmean).
+    # 3. Setup Optimizer and DensityState
     base_lr = 1e-3
     scaled_lr = base_lr * num_devices
     print(f"Scaling learning rate to {scaled_lr} (Base: {base_lr} * {num_devices} devices)")
     optimizer = optax.adam(learning_rate=scaled_lr)
-    opt_state = optimizer.init(gaussians)
-    state = (gaussians, opt_state)
+    
+    max_gaussians = min(2_000_000, len(xyz) * 4) # Max buffer size
+    print(f"Initializing DensityState with max_gaussians={max_gaussians}")
+    state = init_density_state(gaussians, optimizer, max_gaussians)
     
     # 4. Prepare data on device
     all_targets = jnp.stack(jax_targets)
@@ -128,12 +148,10 @@ def run_parallel_training(num_iterations: int = 30000,
         os.makedirs(progress_dir, exist_ok=True)
         os.makedirs(ply_dir, exist_ok=True)
 
-    # Adjust steps per block so the effective number of iterations 
-    # (devices * steps) roughly matches the single-device behavior per block.
-    base_steps_per_block = 500
+    # Base steps is 100 to allow density control at comparable intervals to single device
+    base_steps_per_block = 100
     steps_per_block = max(1, base_steps_per_block // num_devices)
     
-    # Adjust total blocks so total effective iterations matches target
     effective_iterations_per_block = steps_per_block * num_devices
     num_blocks = num_iterations // effective_iterations_per_block
     
@@ -161,19 +179,27 @@ def run_parallel_training(num_iterations: int = 30000,
         )
         
         avg_loss = jnp.mean(losses[0])
-        pbar.set_description(f"Loss: {avg_loss:.4f}")
         
         # Track by effective iterations
         curr_effective_iter = (b + 1) * effective_iterations_per_block
         
+        if 500 < curr_effective_iter <= 15000:
+            curr_state = pmap_density_step(curr_state)
+            num_active = curr_state.active_mask[0].sum().item()
+            pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active}")
+        else:
+            num_active = curr_state.active_mask[0].sum().item()
+            pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active}")
+        
         if curr_effective_iter % 1000 == 0 or b == num_blocks - 1:
             # Capture state for background task
-            snap_gaussians = jax.tree_util.tree_map(lambda x: x[0], curr_state[0])
+            snap_state = jax.tree_util.tree_map(lambda x: x[0], curr_state)
+            snap_gaussians_dict = get_active_gaussians(snap_state)
             
-            # Submit background task (inject render and save_ply functions)
+            # Submit background task
             fut = executor.submit(
                 save_artifacts_task, 
-                snap_gaussians, curr_effective_iter, progress_dir, ply_dir, 
+                snap_gaussians_dict, curr_effective_iter, progress_dir, ply_dir, 
                 jax_cameras[0], fast_tpu_rasterizer, scene_name, render, save_ply
             )
             futures.append(fut)
@@ -181,14 +207,15 @@ def run_parallel_training(num_iterations: int = 30000,
             # Keep only the last few futures to avoid memory pressure
             futures = [f for f in futures if not f.done()]
 
-
     # Final Save
     print("Waiting for background tasks to complete...")
     concurrent.futures.wait(futures)
     executor.shutdown()
 
     print("Training done. Saving final model...")
-    final_gaussians = jax.tree_util.tree_map(lambda x: x[0], curr_state[0])
+    final_state = jax.tree_util.tree_map(lambda x: x[0], curr_state)
+    from jax_gs.core.gaussians import Gaussians
+    final_gaussians = Gaussians(**get_active_gaussians(final_state))
     save_ply(f"{output_dir}/{scene_name}_final.ply", final_gaussians)
 
 if __name__ == "__main__":
