@@ -18,10 +18,10 @@ from jax_gs.training.trainer import train_step_internal
 from jax_gs.core.gaussians import init_gaussians_from_pcd
 from jax_gs.io.ply import save_ply
 from jax_gs.renderer.renderer import render
-from jax_gs.training.density import init_density_state, densify_and_prune
+from jax_gs.training.density import init_density_state, densify_and_prune, reset_opacities
 
-@partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(4, 5, 6, 7))
-def train_block(state, rng_key, all_targets, all_w2cs, steps_per_block, camera_static, optimizer, fast_tpu_rasterizer):
+@partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(4, 5, 6, 7, 8))
+def train_block(state, rng_key, all_targets, all_w2cs, steps_per_block, camera_static, optimizer, fast_tpu_rasterizer, sh_degree):
     def one_step(carry, _):
         state, key = carry
         key, subkey = jax.random.split(key)
@@ -32,26 +32,31 @@ def train_block(state, rng_key, all_targets, all_w2cs, steps_per_block, camera_s
         w2c = all_w2cs[idx]
         
         # Perform training step
-        state, loss, metrics = train_step_internal(state, target, w2c, camera_static, optimizer, fast_tpu_rasterizer=fast_tpu_rasterizer)
+        state, loss, metrics = train_step_internal(state, target, w2c, camera_static, optimizer, fast_tpu_rasterizer=fast_tpu_rasterizer, sh_degree=sh_degree)
         
         return (state, key), loss
 
     (state, rng_key), losses = jax.lax.scan(one_step, (state, rng_key), None, length=steps_per_block)
     return state, rng_key, losses
     
-@partial(jax.pmap, axis_name='batch')
-def pmap_density_step(state, rng_key):
+@partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(2,))
+def pmap_density_step(state, rng_key, extent):
     rng_key, subkey = jax.random.split(rng_key)
-    state = densify_and_prune(state, subkey, extent=5.0)
+    # Lower grad_threshold (0.00002) to account for jnp.mean() loss normalization
+    state = densify_and_prune(state, subkey, extent=extent, grad_threshold=0.00002)
     return state, rng_key
 
-def save_artifacts_task(gaussians_dict, iteration, progress_dir, ply_dir, camera, fast_tpu_rasterizer, scene_name, render_fn, save_ply_fn):
+@partial(jax.pmap, axis_name='batch')
+def pmap_opacity_reset_step(state):
+    return reset_opacities(state)
+
+def save_artifacts_task(gaussians_dict, iteration, progress_dir, ply_dir, camera, fast_tpu_rasterizer, scene_name, render_fn, save_ply_fn, sh_degree):
     """Task to be run in a background thread."""
     from jax_gs.core.gaussians import Gaussians
     gaussians = Gaussians(**gaussians_dict)
     
     # Trigger render (async on TPU)
-    img, _ = render_fn(gaussians, camera, fast_tpu_rasterizer=fast_tpu_rasterizer)
+    img, _ = render_fn(gaussians, camera, fast_tpu_rasterizer=fast_tpu_rasterizer, sh_degree=sh_degree)
     
     # Materialize image to host (blocks thread, but not main training loop)
     img_np = np.array(img)
@@ -103,24 +108,47 @@ def run_parallel_training(num_iterations: int = 30000,
     print(f"Loaded {len(xyz)} points")
     print(f"Prepared {len(jax_cameras)} cameras for training")
     
+    # Calculate scene extent
+    xyz_mean = np.mean(xyz, axis=0)
+    extent = np.max(np.linalg.norm(xyz - xyz_mean, axis=1))
+    print(f"Scene extent: {extent:.4f}")
+    
     # 2. Initialize Gaussians
-    gaussians = init_fn(np.array(xyz), np.array(rgb))
+    gaussians = init_gaussians_from_pcd(np.array(xyz), np.array(rgb))
     
     # 3. Setup Optimizer and DensityState
-    base_lr = 1e-3
-    end_lr = 1e-5
-    
-    # We use an exponential decay scheduler for the learning rate to ensure stable convergence.
-    # We avoid linear scaling by num_devices which can cause divergence on complex scenes like 'room'.
-    lr_schedule = optax.exponential_decay(
-        init_value=base_lr,
+    # Parameter-specific learning rates
+    means_lr_init = 0.00016 * extent
+    means_lr_end = 0.0000016 * extent
+    means_lr_schedule = optax.exponential_decay(
+        init_value=means_lr_init,
         transition_steps=num_iterations,
-        decay_rate=end_lr / base_lr
+        decay_rate=means_lr_end / means_lr_init
     )
-    print(f"Using exponential learning rate decay: {base_lr} -> {end_lr}")
-    optimizer = optax.adam(learning_rate=lr_schedule)
     
-    max_gaussians = min(2_000_000, len(xyz) * 4) # Max buffer size
+    from jax_gs.core.gaussians import Gaussians
+    param_labels = Gaussians(
+        means="means",
+        scales="scales",
+        quaternions="quaternions",
+        opacities="opacities",
+        sh_coeffs="sh_coeffs"
+    )
+    
+    optimizer = optax.multi_transform(
+        {
+            "means": optax.adam(learning_rate=means_lr_schedule),
+            "scales": optax.adam(learning_rate=0.005),
+            "quaternions": optax.adam(learning_rate=0.001),
+            "opacities": optax.adam(learning_rate=0.05),
+            "sh_coeffs": optax.adam(learning_rate=0.0025),
+        },
+        param_labels
+    )
+    
+    print(f"Using 3DGS multi-parameter optimizer (Means LR: {means_lr_init:.2e} -> {means_lr_end:.2e})")
+    
+    max_gaussians = 200_000 # Reduced from 1M for faster JIT
     print(f"Initializing DensityState with max_gaussians={max_gaussians}")
     state = init_density_state(gaussians, optimizer, max_gaussians)
     
@@ -178,26 +206,39 @@ def run_parallel_training(num_iterations: int = 30000,
     futures = []
 
     for b in pbar:
+        # SH Degree Scheduling
+        curr_iter = b * steps_per_block
+        sh_degree = min(3, curr_iter // 1000)
+
         # Parallel training block
         curr_state, curr_rng, losses = train_block(
             curr_state, curr_rng, replicated_targets, replicated_w2cs, 
-            steps_per_block, camera_static, optimizer, fast_tpu_rasterizer
+            steps_per_block, camera_static, optimizer, fast_tpu_rasterizer, sh_degree
         )
         
         avg_loss = jnp.mean(losses[0])
         
         # Track by total steps performed on parameters
-        curr_iter = (b + 1) * steps_per_block
+        curr_iter_eff = (b + 1) * steps_per_block
         
-        if 500 < curr_iter <= 15000:
-            curr_state, curr_rng = pmap_density_step(curr_state, curr_rng)
+        if 500 < curr_iter_eff <= 15000:
+            curr_state, curr_rng = pmap_density_step(curr_state, curr_rng, extent)
+            
+            # Periodically reset opacities (every 3000 steps)
+            if curr_iter_eff % 3000 == 0:
+                curr_state = pmap_opacity_reset_step(curr_state)
+                
             num_active = curr_state.active_mask[0].sum().item()
-            pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active}")
+            pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active} | SH: {sh_degree}")
+            if b % 10 == 0:
+                print(f"Block {b}/{num_blocks} | Loss: {avg_loss:.4f} | Active: {num_active} | SH: {sh_degree}")
         else:
             num_active = curr_state.active_mask[0].sum().item()
-            pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active}")
+            pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active} | SH: {sh_degree}")
+            if b % 10 == 0:
+                print(f"Block {b}/{num_blocks} | Loss: {avg_loss:.4f} | Active: {num_active} | SH: {sh_degree}")
         
-        if curr_iter % 1000 == 0 or b == num_blocks - 1:
+        if curr_iter_eff % 1000 == 0 or b == num_blocks - 1:
             # Capture state for background task
             snap_state = jax.tree_util.tree_map(lambda x: x[0], curr_state)
             snap_gaussians_dict = get_active_gaussians(snap_state)
@@ -205,8 +246,8 @@ def run_parallel_training(num_iterations: int = 30000,
             # Submit background task
             fut = executor.submit(
                 save_artifacts_task, 
-                snap_gaussians_dict, curr_iter, progress_dir, ply_dir, 
-                jax_cameras[0], fast_tpu_rasterizer, scene_name, render, save_ply
+                snap_gaussians_dict, curr_iter_eff, progress_dir, ply_dir, 
+                jax_cameras[0], fast_tpu_rasterizer, scene_name, render, save_ply, sh_degree
             )
             futures.append(fut)
             

@@ -5,7 +5,7 @@ from jax_gs.renderer.projection import project_gaussians
 from jax_gs.renderer.rasterizer import get_tile_interactions, render_tiles, TILE_SIZE
 
 def render(gaussians: Gaussians, camera: Camera, background=jnp.array([0.0, 0.0, 0.0]), 
-           fast_tpu_rasterizer: bool = False):
+           fast_tpu_rasterizer: bool = False, mask=None, sh_degree: int = 0):
     """
     Main entry point for rendering.
 
@@ -14,17 +14,22 @@ def render(gaussians: Gaussians, camera: Camera, background=jnp.array([0.0, 0.0,
         camera: Camera dataclass
         background: Background color
         fast_tpu_rasterizer: Use optimized JAX scan rasterizer for TPU
+        mask: Optional mask for active Gaussians
+        sh_degree: Current SH degree to use for color computation (0-3)
     Returns:
         image: Rendered image
         extras: Optional dictionary with auxiliary maps (depth, normals, etc.)
     """
     # --- 3DGS Pipeline ---
     # 1. Project Gaussians to 2D
-    means2D, cov2D, radii, valid_mask, depths = project_gaussians(gaussians, camera)
-    
+    means2D, cov2D, radii, valid_mask, depths = project_gaussians(gaussians, camera, mask=mask)
+
+    # SH computation (limited by sh_degree)
+    # For now, we only implement degree 0 (DC component)
+    # In a full implementation, we'd add view-dependent colors here
     colors = gaussians.sh_coeffs[:, 0, :] * 0.28209479177387814 + 0.5
     colors = jnp.clip(colors, 0.0, 1.0)
-    
+
     # 2. Sort interactions
     sorted_tile_ids, sorted_gaussian_ids, n_interactions = get_tile_interactions(
         means2D, radii, valid_mask, depths, camera.H, camera.W, TILE_SIZE

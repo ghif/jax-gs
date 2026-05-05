@@ -3,13 +3,14 @@ import jax.numpy as jnp
 from jax_gs.core.gaussians import Gaussians, get_covariance_3d
 from jax_gs.core.camera import Camera
 
-def project_gaussians(gaussians: Gaussians, camera: Camera):
+def project_gaussians(gaussians: Gaussians, camera: Camera, mask=None):
     """
     Project 3D Gaussians to 2D splats.
 
     Args:
         gaussians: Gaussians dataclass
         camera: Camera dataclass 
+        mask: Optional boolean mask of active Gaussians.
     Returns:
         means2D: 2D means of the projected splats
         cov2D: 2D covariance of the projected splats
@@ -29,6 +30,8 @@ def project_gaussians(gaussians: Gaussians, camera: Camera):
     
     # 2. Filter 
     valid_mask = z > 0.01
+    if mask is not None:
+        valid_mask = valid_mask & mask
     
     # 3. Covariance
     cov3D = get_covariance_3d(scales, quats)

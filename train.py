@@ -17,16 +17,16 @@ from jax_gs.io.colmap import load_colmap_dataset
 from jax_gs.core.gaussians import init_gaussians_from_pcd
 from jax_gs.io.ply import save_ply
 from jax_gs.training.trainer import train_step
-from jax_gs.training.density import init_density_state, densify_and_prune
+from jax_gs.training.density import init_density_state, densify_and_prune, reset_opacities
 from jax_gs.renderer.renderer import render
 
-def save_artifacts_task(gaussians_dict, iteration, progress_dir, ply_dir, camera, fast_tpu_rasterizer, scene_name, render_fn, save_ply_fn):
+def save_artifacts_task(gaussians_dict, iteration, progress_dir, ply_dir, camera, fast_tpu_rasterizer, scene_name, render_fn, save_ply_fn, sh_degree):
     """Task to be run in a background thread."""
     from jax_gs.core.gaussians import Gaussians
     gaussians = Gaussians(**gaussians_dict)
     
     # Trigger render (async on TPU)
-    img, _ = render_fn(gaussians, camera, fast_tpu_rasterizer=fast_tpu_rasterizer)
+    img, _ = render_fn(gaussians, camera, fast_tpu_rasterizer=fast_tpu_rasterizer, sh_degree=sh_degree)
     
     # Materialize image to host (blocks thread, but not main training loop)
     img_np = np.array(img)
@@ -67,8 +67,8 @@ def run_training(num_iterations: int = 30000,
 
     init_fn = init_gaussians_from_pcd
 
-    @partial(jax.jit, static_argnums=(4, 5, 6, 7))
-    def train_block(state, rng_key, all_targets, all_w2cs, steps_per_block, camera_static, optimizer, fast_tpu_rasterizer):
+    @partial(jax.jit, static_argnums=(4, 5, 6, 7, 8))
+    def train_block(state, rng_key, all_targets, all_w2cs, steps_per_block, camera_static, optimizer, fast_tpu_rasterizer, sh_degree):
         def one_step(carry, _):
             state, key = carry
             key, subkey = jax.random.split(key)
@@ -79,17 +79,13 @@ def run_training(num_iterations: int = 30000,
             w2c = all_w2cs[idx]
             
             # Perform training step
-            state, loss, metrics = train_step(state, target, w2c, camera_static, optimizer, fast_tpu_rasterizer=fast_tpu_rasterizer)
+            state, loss, metrics = train_step(state, target, w2c, camera_static, optimizer, fast_tpu_rasterizer=fast_tpu_rasterizer, sh_degree=sh_degree)
             
             return (state, key), loss
 
         (state, rng_key), losses = jax.lax.scan(one_step, (state, rng_key), None, length=steps_per_block)
         return state, rng_key, losses
         
-    @jax.jit
-    def density_step(state, rng_key):
-        return densify_and_prune(state, rng_key, extent=5.0)
-
     # 1. Load Data
     path = data_path
     xyz, rgb, jax_cameras, jax_targets = load_colmap_dataset(path, images_subdir)
@@ -97,25 +93,59 @@ def run_training(num_iterations: int = 30000,
     print(f"Loaded {len(xyz)} points")
     print(f"Prepared {len(jax_cameras)} cameras for training")
     
+    # Calculate scene extent for scaling learning rates and density thresholds
+    xyz_mean = np.mean(xyz, axis=0)
+    extent = np.max(np.linalg.norm(xyz - xyz_mean, axis=1))
+    print(f"Scene extent: {extent:.4f}")
+    
     # 2. Initialize Gaussians
     gaussians = init_fn(np.array(xyz), np.array(rgb))
     
     # 3. Setup Optimizer and DensityState
-    base_lr = 1e-3
-    end_lr = 1e-5
-    
-    # We use an exponential decay scheduler for the learning rate to ensure stable convergence
-    lr_schedule = optax.exponential_decay(
-        init_value=base_lr,
+    # Parameter-specific learning rates (tuned for JAX pixel-averaged loss)
+    # Using original paper scaling (0.00016 * extent) for stability
+    means_lr_init = 0.00016 * extent
+    means_lr_end = 0.0000016 * extent
+    means_lr_schedule = optax.exponential_decay(
+        init_value=means_lr_init,
         transition_steps=num_iterations,
-        decay_rate=end_lr / base_lr
+        decay_rate=means_lr_end / means_lr_init
     )
-    print(f"Using exponential learning rate decay: {base_lr} -> {end_lr}")
-    optimizer = optax.adam(learning_rate=lr_schedule)
     
-    max_gaussians = min(2_000_000, len(xyz) * 4) # Max buffer size
+    from jax_gs.core.gaussians import Gaussians
+    param_labels = Gaussians(
+        means="means",
+        scales="scales",
+        quaternions="quaternions",
+        opacities="opacities",
+        sh_coeffs="sh_coeffs"
+    )
+    
+    optimizer = optax.multi_transform(
+        {
+            "means": optax.adam(learning_rate=means_lr_schedule),
+            "scales": optax.adam(learning_rate=0.005),
+            "quaternions": optax.adam(learning_rate=0.001),
+            "opacities": optax.adam(learning_rate=0.05),
+            "sh_coeffs": optax.adam(learning_rate=0.0025),
+        },
+        param_labels
+    )
+    
+    print(f"Using 3DGS multi-parameter optimizer (Means LR: {means_lr_init:.2e} -> {means_lr_end:.2e})")
+    
+    max_gaussians = 200_000 # Reduced from 1M for faster JIT
     print(f"Initializing DensityState with max_gaussians={max_gaussians}")
     state = init_density_state(gaussians, optimizer, max_gaussians)
+    
+    @jax.jit
+    def density_step(state, rng_key):
+        # Lower grad_threshold (0.00002) to account for jnp.mean() loss normalization
+        return densify_and_prune(state, rng_key, extent=extent, grad_threshold=0.00002)
+        
+    @jax.jit
+    def opacity_reset_step(state):
+        return reset_opacities(state)
     
     # 4. Prepare data on device
     all_targets = jnp.stack(jax_targets)
@@ -156,10 +186,14 @@ def run_training(num_iterations: int = 30000,
     futures = []
 
     for b in pbar:
+        # SH Degree Scheduling: Increase degree every 1000 iterations (approx)
+        curr_iter = b * steps_per_block
+        sh_degree = min(3, curr_iter // 1000)
+
         # Compiled training block
         curr_state, curr_rng, losses = train_block(
             curr_state, curr_rng, all_targets, all_w2cs, 
-            steps_per_block, camera_static, optimizer, fast_tpu_rasterizer
+            steps_per_block, camera_static, optimizer, fast_tpu_rasterizer, sh_degree
         )
         
         avg_loss = jnp.mean(losses)
@@ -169,11 +203,20 @@ def run_training(num_iterations: int = 30000,
         if 500 < curr_iter <= 15000:
             curr_rng, density_rng = jax.random.split(curr_rng)
             curr_state = density_step(curr_state, density_rng)
+            
+            # Periodically reset opacities (every 3000 steps)
+            if curr_iter % 3000 == 0:
+                curr_state = opacity_reset_step(curr_state)
+                
             num_active = curr_state.active_mask.sum().item()
-            pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active}")
+            pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active} | SH: {sh_degree}")
+            if b % 10 == 0:
+                print(f"Block {b}/{num_blocks} | Loss: {avg_loss:.4f} | Active: {num_active} | SH: {sh_degree}")
         else:
             num_active = curr_state.active_mask.sum().item()
-            pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active}")
+            pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active} | SH: {sh_degree}")
+            if b % 10 == 0:
+                print(f"Block {b}/{num_blocks} | Loss: {avg_loss:.4f} | Active: {num_active} | SH: {sh_degree}")
         
         if curr_iter % 1000 == 0:
             # Capture state for background task
@@ -183,7 +226,7 @@ def run_training(num_iterations: int = 30000,
             fut = executor.submit(
                 save_artifacts_task, 
                 snap_gaussians_dict, curr_iter, progress_dir, ply_dir, 
-                jax_cameras[0], fast_tpu_rasterizer, scene_name, render, save_ply
+                jax_cameras[0], fast_tpu_rasterizer, scene_name, render, save_ply, sh_degree
             )
             futures.append(fut)
             
@@ -213,4 +256,3 @@ if __name__ == "__main__":
                  data_path=args.data_path, output_base=args.output_path,
                  fast_tpu_rasterizer=args.fast_tpu_rasterizer,
                  images_subdir=args.images_subdir)
-
