@@ -42,15 +42,15 @@ def train_block(state, rng_key, all_targets, all_w2cs, steps_per_block, camera_s
 @partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(2,))
 def pmap_density_step(state, rng_key, extent):
     rng_key, subkey = jax.random.split(rng_key)
-    # Lower grad_threshold (0.00002) to account for jnp.mean() loss normalization
-    state = densify_and_prune(state, subkey, extent=extent, grad_threshold=0.00002)
+    # Lower grad_threshold (0.000005) to account for jnp.mean() loss normalization
+    state = densify_and_prune(state, subkey, extent=extent, grad_threshold=0.000005)
     return state, rng_key
 
 @partial(jax.pmap, axis_name='batch')
 def pmap_opacity_reset_step(state):
     return reset_opacities(state)
 
-def save_artifacts_task(gaussians_dict, iteration, progress_dir, ply_dir, camera, fast_tpu_rasterizer, scene_name, render_fn, save_ply_fn, sh_degree):
+def save_artifacts_task(gaussians_dict, iteration, progress_dir, ply_path, camera, fast_tpu_rasterizer, render_fn, save_ply_fn, sh_degree):
     """Task to be run in a background thread."""
     from jax_gs.core.gaussians import Gaussians
     gaussians = Gaussians(**gaussians_dict)
@@ -69,8 +69,8 @@ def save_artifacts_task(gaussians_dict, iteration, progress_dir, ply_dir, camera
         pil_img.save(buf, format="PNG")
         f.write(buf.getvalue())
     
-    # Save PLY (materializes Gaussians to host)
-    save_ply_fn(f"{ply_dir}/{scene_name}_splats_{iteration:04d}.ply", gaussians)
+    # Save PLY (overwrite the same file to save space)
+    save_ply_fn(ply_path, gaussians)
 
 def get_active_gaussians(state):
     """Extracts only the active Gaussians into a host-side dictionary for saving."""
@@ -148,8 +148,9 @@ def run_parallel_training(num_iterations: int = 30000,
     
     print(f"Using 3DGS multi-parameter optimizer (Means LR: {means_lr_init:.2e} -> {means_lr_end:.2e})")
     
-    max_gaussians = 200_000 # Reduced from 1M for faster JIT
-    print(f"Initializing DensityState with max_gaussians={max_gaussians}")
+    # Recommendation 4: Dynamic max_gaussians (Allow 10x growth, cap at 500k)
+    max_gaussians = min(len(xyz) * 10, 500_000)
+    print(f"Initializing DensityState with dynamic max_gaussians={max_gaussians} (initial: {len(xyz)})")
     state = init_density_state(gaussians, optimizer, max_gaussians)
     
     # 4. Prepare data on device
@@ -228,12 +229,12 @@ def run_parallel_training(num_iterations: int = 30000,
             if curr_iter_eff % 3000 == 0:
                 curr_state = pmap_opacity_reset_step(curr_state)
                 
-            num_active = curr_state.active_mask[0].sum().item()
+            num_active = curr_state.active_mask[0].sum()
             pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active} | SH: {sh_degree}")
             if b % 10 == 0:
                 print(f"Block {b}/{num_blocks} | Loss: {avg_loss:.4f} | Active: {num_active} | SH: {sh_degree}")
         else:
-            num_active = curr_state.active_mask[0].sum().item()
+            num_active = curr_state.active_mask[0].sum()
             pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active} | SH: {sh_degree}")
             if b % 10 == 0:
                 print(f"Block {b}/{num_blocks} | Loss: {avg_loss:.4f} | Active: {num_active} | SH: {sh_degree}")
@@ -244,10 +245,11 @@ def run_parallel_training(num_iterations: int = 30000,
             snap_gaussians_dict = get_active_gaussians(snap_state)
             
             # Submit background task
+            ply_path = f"{ply_dir}/{scene_name}_latest.ply"
             fut = executor.submit(
                 save_artifacts_task, 
-                snap_gaussians_dict, curr_iter_eff, progress_dir, ply_dir, 
-                jax_cameras[0], fast_tpu_rasterizer, scene_name, render, save_ply, sh_degree
+                snap_gaussians_dict, curr_iter_eff, progress_dir, ply_path, 
+                jax_cameras[0], fast_tpu_rasterizer, render, save_ply, sh_degree
             )
             futures.append(fut)
             

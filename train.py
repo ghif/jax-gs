@@ -20,7 +20,7 @@ from jax_gs.training.trainer import train_step
 from jax_gs.training.density import init_density_state, densify_and_prune, reset_opacities
 from jax_gs.renderer.renderer import render
 
-def save_artifacts_task(gaussians_dict, iteration, progress_dir, ply_dir, camera, fast_tpu_rasterizer, scene_name, render_fn, save_ply_fn, sh_degree):
+def save_artifacts_task(gaussians_dict, iteration, progress_dir, ply_path, camera, fast_tpu_rasterizer, render_fn, save_ply_fn, sh_degree):
     """Task to be run in a background thread."""
     from jax_gs.core.gaussians import Gaussians
     gaussians = Gaussians(**gaussians_dict)
@@ -39,11 +39,12 @@ def save_artifacts_task(gaussians_dict, iteration, progress_dir, ply_dir, camera
         pil_img.save(buf, format="PNG")
         f.write(buf.getvalue())
     
-    # Save PLY (materializes Gaussians to host)
-    save_ply_fn(f"{ply_dir}/{scene_name}_splats_{iteration:04d}.ply", gaussians)
+    # Save PLY (overwrite the same file to save space)
+    save_ply_fn(ply_path, gaussians)
 
 def get_active_gaussians(state):
     """Extracts only the active Gaussians into a host-side dictionary for saving."""
+    # REVERT: Move contiguous arrays to host first. Slicing on device from host-loop is slow.
     active = np.array(state.active_mask)
     g = state.gaussians
     return {
@@ -73,7 +74,7 @@ def run_training(num_iterations: int = 30000,
             state, key = carry
             key, subkey = jax.random.split(key)
             
-            # Sample camera index
+            # REVERT: Sample single camera index for sequential processing
             idx = jax.random.randint(subkey, (), 0, all_targets.shape[0])
             target = all_targets[idx]
             w2c = all_w2cs[idx]
@@ -134,14 +135,15 @@ def run_training(num_iterations: int = 30000,
     
     print(f"Using 3DGS multi-parameter optimizer (Means LR: {means_lr_init:.2e} -> {means_lr_end:.2e})")
     
-    max_gaussians = 200_000 # Reduced from 1M for faster JIT
-    print(f"Initializing DensityState with max_gaussians={max_gaussians}")
+    # KEEP OPTIMIZATION: Dynamic max_gaussians
+    max_gaussians = min(len(xyz) * 10, 500_000)
+    print(f"Initializing DensityState with dynamic max_gaussians={max_gaussians} (initial: {len(xyz)})")
     state = init_density_state(gaussians, optimizer, max_gaussians)
     
     @jax.jit
     def density_step(state, rng_key):
-        # Lower grad_threshold (0.00002) to account for jnp.mean() loss normalization
-        return densify_and_prune(state, rng_key, extent=extent, grad_threshold=0.00002)
+        # Lower grad_threshold (0.000005) to account for jnp.mean() loss normalization
+        return densify_and_prune(state, rng_key, extent=extent, grad_threshold=0.000005)
         
     @jax.jit
     def opacity_reset_step(state):
@@ -208,12 +210,12 @@ def run_training(num_iterations: int = 30000,
             if curr_iter % 3000 == 0:
                 curr_state = opacity_reset_step(curr_state)
                 
-            num_active = curr_state.active_mask.sum().item()
+            num_active = curr_state.active_mask.sum()
             pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active} | SH: {sh_degree}")
             if b % 10 == 0:
                 print(f"Block {b}/{num_blocks} | Loss: {avg_loss:.4f} | Active: {num_active} | SH: {sh_degree}")
         else:
-            num_active = curr_state.active_mask.sum().item()
+            num_active = curr_state.active_mask.sum()
             pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active} | SH: {sh_degree}")
             if b % 10 == 0:
                 print(f"Block {b}/{num_blocks} | Loss: {avg_loss:.4f} | Active: {num_active} | SH: {sh_degree}")
@@ -223,10 +225,11 @@ def run_training(num_iterations: int = 30000,
             snap_gaussians_dict = get_active_gaussians(curr_state)
             
             # Submit background task (inject render and save_ply functions)
+            ply_path = f"{ply_dir}/{scene_name}_latest.ply"
             fut = executor.submit(
                 save_artifacts_task, 
-                snap_gaussians_dict, curr_iter, progress_dir, ply_dir, 
-                jax_cameras[0], fast_tpu_rasterizer, scene_name, render, save_ply, sh_degree
+                snap_gaussians_dict, curr_iter, progress_dir, ply_path, 
+                jax_cameras[0], fast_tpu_rasterizer, render, save_ply, sh_degree
             )
             futures.append(fut)
             

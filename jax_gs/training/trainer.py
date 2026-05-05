@@ -15,7 +15,7 @@ def _compute_loss_and_metrics(params, target_image, w2c, camera_static, fast_tpu
     W, H, fx, fy, cx, cy = camera_static
     camera = Camera(W=W, H=H, fx=fx, fy=fy, cx=cx, cy=cy, W2C=w2c, full_proj=jnp.eye(4))
     
-    lambda_ssim = 0.2
+    lambda_ssim = 0.4
     
     # We pass the active mask to the renderer so it ignores inactive padded Gaussians.
     image, extras = render(params, camera, fast_tpu_rasterizer=fast_tpu_rasterizer, mask=active_mask, sh_degree=sh_degree)
@@ -30,7 +30,7 @@ def _compute_loss_and_metrics(params, target_image, w2c, camera_static, fast_tpu
         "ssim": 1.0 - d_ssim * 2.0
     }
 
-    return total_loss, metrics
+    return total_loss, (metrics, extras)
 
 def _mask_updates(updates, active_mask):
     def apply_mask(u):
@@ -54,7 +54,7 @@ def train_step_internal(state: DensityState, target_image, w2c, camera_static, o
     def loss_fn(p):
         return _compute_loss_and_metrics(p, target_image, w2c, camera_static, fast_tpu_rasterizer, active, sh_degree=sh_degree)
     
-    (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    (loss, (metrics, extras)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
     
     # SPMD Average
     grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name='batch'), grads)
@@ -91,10 +91,16 @@ def train_step_internal(state: DensityState, target_image, w2c, camera_static, o
     next_grad_accum = state.grad_accum + grad_2d_mag
     next_denom = state.denom + jnp.where(active, 1, 0)
     
-    # Update max radii (we can just compute current radii)
-    _, _, radii, _, _ = project_gaussians(params, camera, mask=active)
-    radii = jax.lax.pmax(radii, axis_name='batch') # max across views
-    next_max_radii = jnp.maximum(state.max_radii, radii)
+    # Update max radii (only for validly projected Gaussians)
+    radii = extras["radii"]
+    valid_proj = extras["valid_mask"]
+    
+    # Mask radii with valid_proj before taking pmax to avoid near-plane blowups
+    radii_masked = jnp.where(valid_proj, radii, 0.0)
+    radii_max = jax.lax.pmax(radii_masked, axis_name='batch')
+    any_valid_proj = jax.lax.pmax(valid_proj, axis_name='batch')
+    
+    next_max_radii = jnp.where(any_valid_proj, jnp.maximum(state.max_radii, radii_max), state.max_radii)
     
     next_state = state.replace(
         gaussians=next_params,
@@ -118,7 +124,7 @@ def train_step(state: DensityState, target_image, w2c, camera_static, optimizer,
     def loss_fn(p):
         return _compute_loss_and_metrics(p, target_image, w2c, camera_static, fast_tpu_rasterizer, active, sh_degree=sh_degree)
     
-    (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    (loss, (metrics, extras)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
     
     updates, next_opt_state = optimizer.update(grads, opt_state, params)
     updates = _mask_updates(updates, active)
@@ -136,8 +142,10 @@ def train_step(state: DensityState, target_image, w2c, camera_static, optimizer,
     next_grad_accum = state.grad_accum + grad_2d_mag
     next_denom = state.denom + jnp.where(active, 1, 0)
     
-    _, _, radii, _, _ = project_gaussians(params, camera, mask=active)
-    next_max_radii = jnp.maximum(state.max_radii, radii)
+    # Update max radii (only for validly projected Gaussians)
+    radii = extras["radii"]
+    valid_proj = extras["valid_mask"]
+    next_max_radii = jnp.where(valid_proj, jnp.maximum(state.max_radii, radii), state.max_radii)
     
     next_state = state.replace(
         gaussians=next_params,

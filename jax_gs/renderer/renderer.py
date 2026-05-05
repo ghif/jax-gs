@@ -35,6 +35,11 @@ def render(gaussians: Gaussians, camera: Camera, background=jnp.array([0.0, 0.0,
         means2D, radii, valid_mask, depths, camera.H, camera.W, TILE_SIZE
     )
     
+    extras = {
+        "radii": radii,
+        "valid_mask": valid_mask
+    }
+    
     # 3. Rasterize tiles
     if fast_tpu_rasterizer:
         from jax_gs.renderer.rasterizer_tpu import render_tiles_tpu
@@ -43,7 +48,6 @@ def render(gaussians: Gaussians, camera: Camera, background=jnp.array([0.0, 0.0,
             sorted_tile_ids, sorted_gaussian_ids,
             camera.H, camera.W, background
         )
-        extras = {}
     else:
         # Rasterize tiles using pure JAX standard implementation
         image = render_tiles(
@@ -51,5 +55,4 @@ def render(gaussians: Gaussians, camera: Camera, background=jnp.array([0.0, 0.0,
             sorted_tile_ids, sorted_gaussian_ids,
             camera.H, camera.W, TILE_SIZE, background
         )
-        extras = {}
     return image, extras
