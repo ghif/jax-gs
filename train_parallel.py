@@ -108,9 +108,17 @@ def run_parallel_training(num_iterations: int = 30000,
     
     # 3. Setup Optimizer and DensityState
     base_lr = 1e-3
-    scaled_lr = base_lr * num_devices
-    print(f"Scaling learning rate to {scaled_lr} (Base: {base_lr} * {num_devices} devices)")
-    optimizer = optax.adam(learning_rate=scaled_lr)
+    end_lr = 1e-5
+    
+    # We use an exponential decay scheduler for the learning rate to ensure stable convergence.
+    # We avoid linear scaling by num_devices which can cause divergence on complex scenes like 'room'.
+    lr_schedule = optax.exponential_decay(
+        init_value=base_lr,
+        transition_steps=num_iterations,
+        decay_rate=end_lr / base_lr
+    )
+    print(f"Using exponential learning rate decay: {base_lr} -> {end_lr}")
+    optimizer = optax.adam(learning_rate=lr_schedule)
     
     max_gaussians = min(2_000_000, len(xyz) * 4) # Max buffer size
     print(f"Initializing DensityState with max_gaussians={max_gaussians}")
