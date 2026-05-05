@@ -40,8 +40,10 @@ def train_block(state, rng_key, all_targets, all_w2cs, steps_per_block, camera_s
     return state, rng_key, losses
     
 @partial(jax.pmap, axis_name='batch')
-def pmap_density_step(state):
-    return densify_and_prune(state, extent=5.0)
+def pmap_density_step(state, rng_key):
+    rng_key, subkey = jax.random.split(rng_key)
+    state = densify_and_prune(state, subkey, extent=5.0)
+    return state, rng_key
 
 def save_artifacts_task(gaussians_dict, iteration, progress_dir, ply_dir, camera, fast_tpu_rasterizer, scene_name, render_fn, save_ply_fn):
     """Task to be run in a background thread."""
@@ -184,7 +186,7 @@ def run_parallel_training(num_iterations: int = 30000,
         curr_effective_iter = (b + 1) * effective_iterations_per_block
         
         if 500 < curr_effective_iter <= 15000:
-            curr_state = pmap_density_step(curr_state)
+            curr_state, curr_rng = pmap_density_step(curr_state, curr_rng)
             num_active = curr_state.active_mask[0].sum().item()
             pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active}")
         else:

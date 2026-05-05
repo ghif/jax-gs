@@ -87,8 +87,8 @@ def run_training(num_iterations: int = 30000,
         return state, rng_key, losses
         
     @jax.jit
-    def density_step(state):
-        return densify_and_prune(state, extent=5.0)
+    def density_step(state, rng_key):
+        return densify_and_prune(state, rng_key, extent=5.0)
 
     # 1. Load Data
     path = data_path
@@ -156,7 +156,8 @@ def run_training(num_iterations: int = 30000,
         
         # Adaptive Density Control
         if 500 < curr_iter <= 15000:
-            curr_state = density_step(curr_state)
+            curr_rng, density_rng = jax.random.split(curr_rng)
+            curr_state = density_step(curr_state, density_rng)
             num_active = curr_state.active_mask.sum().item()
             pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active}")
         else:
