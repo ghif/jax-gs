@@ -66,8 +66,18 @@ def _reset_accumulators(state: DensityState) -> DensityState:
         denom=jnp.zeros_like(state.denom)
     )
 
+def reorder_opt_state(opt_state, gather_indices):
+    """Reorders the optimizer state pytree leaves according to gather_indices."""
+    def reorder_leaf(x):
+        # We only reorder arrays that match the number of Gaussians
+        if hasattr(x, 'ndim') and x.ndim >= 1 and x.shape[0] == gather_indices.shape[0]:
+            return x[gather_indices]
+        return x
+    return jax.tree_util.tree_map(reorder_leaf, opt_state)
+
 def densify_and_prune(
     state: DensityState, 
+    rng_key: jax.Array,
     grad_threshold: float = 0.0002, 
     min_opacity: float = 0.005, 
     extent: float = 5.0, # scene radius extent approx
@@ -78,6 +88,7 @@ def densify_and_prune(
     """
     g = state.gaussians
     active = state.active_mask
+    MAX_GAUSSIANS = active.shape[0]
     
     # 1. PRUNE
     # Opacity condition
@@ -85,7 +96,6 @@ def densify_and_prune(
     prune_mask = (sig_ops < min_opacity)
     
     # Size condition (world space)
-    # Scales are in log space, so exp(scale) is actual scale
     scales_act = jnp.exp(g.scales)
     max_scales = jnp.max(scales_act, axis=-1)
     prune_mask = prune_mask | (max_scales > 0.1 * extent)
@@ -94,96 +104,86 @@ def densify_and_prune(
     prune_mask = prune_mask | (state.max_radii > max_screen_size)
     
     prune_mask = prune_mask & active
+    active_after_prune = active & (~prune_mask)
     
     # 2. DENSIFY
     avg_grad = jnp.where(state.denom > 0, state.grad_accum / state.denom, 0.0)
-    densify_mask = (avg_grad >= grad_threshold) & active
+    densify_mask = (avg_grad >= grad_threshold) & active_after_prune
     
-    # Don't densify things we are pruning
-    densify_mask = densify_mask & (~prune_mask)
-    
-    # Split vs Clone
-    # Split if Gaussian is large, Clone if small but has high gradient
     split_mask = densify_mask & (max_scales > 0.01 * extent)
     clone_mask = densify_mask & (~split_mask)
     
     num_clones = jnp.sum(clone_mask)
     num_splits = jnp.sum(split_mask)
-    total_new = num_clones + num_splits * 2 # Split creates 2, replacing original
+    total_new = num_clones + num_splits
     
-    # We only have a certain number of available slots.
-    available_slots = jnp.sum(~active) + jnp.sum(prune_mask)
-    
-    # To be perfectly safe inside JIT and deterministic, we only densify if we have enough slots.
-    # In a real dynamic system, we might resize, but we are using fixed-size arrays.
+    # Check capacity
+    will_be_empty = ~active_after_prune
+    available_slots = jnp.sum(will_be_empty)
     can_densify = total_new <= available_slots
     
     clone_mask = jnp.where(can_densify, clone_mask, False)
     split_mask = jnp.where(can_densify, split_mask, False)
+    num_clones = jnp.sum(clone_mask)
+    num_splits = jnp.sum(split_mask)
     
-    # Find indices for cloning
-    clone_src_idx = jnp.where(clone_mask, size=state.gaussians.means.shape[0], fill_value=-1)[0]
+    # --- Vectorized Routing ---
+    # Compact indices for sources and destinations using argsort
+    empty_indices = jnp.argsort((~will_be_empty).astype(jnp.int8))
+    clone_src_indices = jnp.argsort((~clone_mask).astype(jnp.int8))
+    split_src_indices = jnp.argsort((~split_mask).astype(jnp.int8))
     
-    # Find indices for splitting
-    split_src_idx = jnp.where(split_mask, size=state.gaussians.means.shape[0], fill_value=-1)[0]
+    idx = jnp.arange(MAX_GAUSSIANS)
+    is_clone_dest = idx < num_clones
+    is_split_dest = (idx >= num_clones) & (idx < num_clones + num_splits)
     
-    # Find available slots for new Gaussians
-    # We create a mask of slots that will be empty AFTER pruning
-    will_be_empty = (~active) | prune_mask
-    will_be_empty = will_be_empty & (~split_mask) # Don't overwrite the ones we are splitting until we extract them
+    # Identify which source to read for each empty slot
+    src_to_read = jnp.where(is_clone_dest, clone_src_indices[idx], 0)
+    src_to_read = jnp.where(is_split_dest, split_src_indices[idx - num_clones], src_to_read)
     
-    empty_idx = jnp.where(will_be_empty, size=state.gaussians.means.shape[0], fill_value=-1)[0]
+    new_values = jnp.where(is_clone_dest | is_split_dest, src_to_read, empty_indices)
     
-    # ----- PERFORM CLONE -----
-    # Copy from clone_src_idx to empty_idx
-    # We need to take care of variable number of clones.
-    # ... This logic inside purely vectorized JIT without dynamic slicing is complex.
-    # A standard trick is to use cumulative sums to route data.
+    gather_indices = jnp.arange(MAX_GAUSSIANS)
+    gather_indices = gather_indices.at[empty_indices].set(new_values)
     
-    # Let's simplify the JIT implementation by using lax.scan or scatter
+    # --- Execute Data Movement ---
+    new_means = g.means[gather_indices]
+    new_scales = g.scales[gather_indices]
+    new_quats = g.quaternions[gather_indices]
+    new_ops = g.opacities[gather_indices]
+    new_sh = g.sh_coeffs[gather_indices]
     
-    # For now, let's construct the NEW state.
+    # Reorder optimizer state moments
+    new_opt_state = reorder_opt_state(state.opt_state, gather_indices)
     
-    # Start with current state, apply pruning
-    new_active = active & (~prune_mask)
+    # --- Apply Modifications ---
+    new_split_mask = jnp.zeros(MAX_GAUSSIANS, dtype=bool)
+    new_split_mask = new_split_mask.at[empty_indices].set(is_split_dest)
+    do_split_scale = split_mask | new_split_mask
     
-    new_means = g.means
-    new_scales = g.scales
-    new_quats = g.quaternions
-    new_ops = g.opacities
-    new_sh = g.sh_coeffs
+    # Divide scale by 1.6
+    new_scales = jnp.where(do_split_scale[:, None], new_scales - jnp.log(1.6), new_scales)
     
-    # We need a robust vectorized way to do this.
-    # Let's use argwhere / scatter.
+    # Break symmetry for splits
+    noise = jax.random.normal(rng_key, (MAX_GAUSSIANS, 3)) * jnp.exp(new_scales)
+    new_means = jnp.where(do_split_scale[:, None], new_means + noise, new_means)
     
-    # To keep this implementation feasible within JIT, we'll use a simpler densification scheme:
-    # 1. Create a buffer of ALL new Gaussians (clones + 2x splits)
-    # 2. Scatter them into the first available inactive slots.
+    # --- Update Masks ---
+    new_active_add = jnp.zeros(MAX_GAUSSIANS, dtype=bool)
+    new_active_add = new_active_add.at[empty_indices].set(is_clone_dest | is_split_dest)
+    final_active = active_after_prune | new_active_add
     
-    # CLONES
-    clone_indices = jnp.where(clone_mask)[0] # Dynamic shape... this breaks JIT if not handled carefully
-    
-    # Let's use a fixed-size buffer approach for the new elements to avoid dynamic shapes.
-    MAX_NEW = 50000 # arbitrary limit per step to keep memory bounded
-    
-    # Instead of full JIT densification which is extremely hard due to dynamic shapes,
-    # let's return masks and do it via a `jax.jit` function that takes fixed sizes or we do the indexing host-side.
-    # Wait, the user asked for fixed-size arrays.
-    
-    # A JIT-compatible way to pack:
-    # We assign an integer ID to each new element.
-    # Cumulative sum over clone_mask gives the index.
-    clone_idx_map = jnp.cumsum(clone_mask) - 1 # 0, 1, 2... for active
-    
-    # ... Actually, implementing full clone/split in pure JIT with static shapes is a massive endeavor 
-    # (requires argsort/cumsum/scatter tricks). 
-    # Let's provide a slightly simplified but correct vectorized version.
-
-    # [Placeholder for complex vectorized gather/scatter]
-    # For the sake of the plan, we will implement the robust padded array logic using jax.lax.scatter
+    # Create the new Gaussian struct
+    new_gaussians = Gaussians(
+        means=new_means,
+        scales=new_scales,
+        quaternions=new_quats,
+        opacities=new_ops,
+        sh_coeffs=new_sh
+    )
     
     # Return reset accumulators
     state = _reset_accumulators(state)
-    state = state.replace(active_mask=new_active)
+    state = state.replace(gaussians=new_gaussians, opt_state=new_opt_state, active_mask=final_active)
     
     return state

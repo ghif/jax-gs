@@ -158,16 +158,12 @@ def run_parallel_training(num_iterations: int = 30000,
         os.makedirs(progress_dir, exist_ok=True)
         os.makedirs(ply_dir, exist_ok=True)
 
-    # Base steps is 100 to allow density control at comparable intervals to single device
-    base_steps_per_block = 100
-    steps_per_block = max(1, base_steps_per_block // num_devices)
-    
-    effective_iterations_per_block = steps_per_block * num_devices
-    num_blocks = num_iterations // effective_iterations_per_block
+    # We use blocks of 100 to allow frequent density control
+    steps_per_block = 100
+    num_blocks = num_iterations // steps_per_block
     
     print(f"Total target iterations: {num_iterations}")
     print(f"Executing {num_blocks} blocks of {steps_per_block} steps per device.")
-    print(f"({effective_iterations_per_block} effective iterations per block)")
 
     pbar = tqdm(range(num_blocks))
     
@@ -190,10 +186,10 @@ def run_parallel_training(num_iterations: int = 30000,
         
         avg_loss = jnp.mean(losses[0])
         
-        # Track by effective iterations
-        curr_effective_iter = (b + 1) * effective_iterations_per_block
+        # Track by total steps performed on parameters
+        curr_iter = (b + 1) * steps_per_block
         
-        if 500 < curr_effective_iter <= 15000:
+        if 500 < curr_iter <= 15000:
             curr_state, curr_rng = pmap_density_step(curr_state, curr_rng)
             num_active = curr_state.active_mask[0].sum().item()
             pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active}")
@@ -201,7 +197,7 @@ def run_parallel_training(num_iterations: int = 30000,
             num_active = curr_state.active_mask[0].sum().item()
             pbar.set_description(f"Loss: {avg_loss:.4f} | Active: {num_active}")
         
-        if curr_effective_iter % 1000 == 0 or b == num_blocks - 1:
+        if curr_iter % 1000 == 0 or b == num_blocks - 1:
             # Capture state for background task
             snap_state = jax.tree_util.tree_map(lambda x: x[0], curr_state)
             snap_gaussians_dict = get_active_gaussians(snap_state)
@@ -209,7 +205,7 @@ def run_parallel_training(num_iterations: int = 30000,
             # Submit background task
             fut = executor.submit(
                 save_artifacts_task, 
-                snap_gaussians_dict, curr_effective_iter, progress_dir, ply_dir, 
+                snap_gaussians_dict, curr_iter, progress_dir, ply_dir, 
                 jax_cameras[0], fast_tpu_rasterizer, scene_name, render, save_ply
             )
             futures.append(fut)
