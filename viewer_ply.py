@@ -64,12 +64,13 @@ def load_ply(path):
     # Extract Means (x, y, z)
     means = data[:, [prop_map['x'], prop_map['y'], prop_map['z']]]
     
-    # Extract Opacities
-    opacities = data[:, prop_map['opacity']]
+    # Extract Opacities (Apply Sigmoid as they are stored in raw inverse-sigmoid space)
+    raw_opacities = data[:, prop_map['opacity']]
+    opacities = 1.0 / (1.0 + np.exp(-raw_opacities))
     
     # Extract Colors (SH DC) -> Convert to RGB
-    # SH DC 0 is R, DC 1 is G, DC 2 is B (approx, actually need to add 0.5 and scale)
-    # in ply_utils: f_dc = (color - 0.5) / 0.282...
+    # SH DC 0 is R, DC 1 is G, DC 2 is B
+    # In jax-gs: sh_dc = (color - 0.5) / 0.282...
     # so color = f_dc * 0.282... + 0.5
     f_dc = data[:, [prop_map['f_dc_0'], prop_map['f_dc_1'], prop_map['f_dc_2']]]
     colors = f_dc * 0.28209479177387814 + 0.5
@@ -77,20 +78,16 @@ def load_ply(path):
     
     # Extract Scales
     scales_data = data[:, [prop_map['scale_0'], prop_map['scale_1'], prop_map['scale_2']]]
-    scales = np.exp(scales_data) # We stored log scales? ply_utils says "scales = np.array(gaussians.scales)". 
-    # Init code says: scales = log distance. So yes, they are log scales.
+    scales = np.exp(scales_data) # Log scales to linear scales
     
     # Extract Rotations (Quaternions)
     quats = data[:, [prop_map['rot_0'], prop_map['rot_1'], prop_map['rot_2'], prop_map['rot_3']]]
     
     # Compute Covariances
-    # We need to construct rotation matrices and scale matrices
-    # R from quaternion
-    # S from scale
-    # Cov = R S S^T R^T
+    # Σ = R S S^T R^T
     
     # Normalized quats
-    norms = np.linalg.norm(quats, axis=1, keepdims=True)
+    norms = np.maximum(np.linalg.norm(quats, axis=1, keepdims=True), 1e-6)
     q = quats / norms
     
     r = q[:, 0]
@@ -110,16 +107,12 @@ def load_ply(path):
     R[:, 2, 1] = 2 * (y*z + r*x)
     R[:, 2, 2] = 1 - 2 * (x*x + y*y)
     
-    S = np.zeros((num_vertices, 3, 3))
-    S[:, 0, 0] = scales[:, 0]
-    S[:, 1, 1] = scales[:, 1]
-    S[:, 2, 2] = scales[:, 2]
-    
+    # S = diag(scales)
     # M = R @ S
-    M = np.einsum('nij,njk->nik', R, S)
+    M = R * scales[:, None, :]
     
     # Cov = M @ M.T
-    covs = np.einsum('nij,nkj->nik', M, M)
+    covs = M @ M.transpose(0, 2, 1)
     
     return means, covs, colors, opacities
 
@@ -137,7 +130,6 @@ def run_ply_viewer(ply_path, port=8080):
     # Set dark mode
     server.configure_theme(dark_mode=True)
     
-    
     @server.on_client_connect
     def _(client: viser.ClientHandle):
         print(f"Client connected: {client.client_id}")
@@ -147,17 +139,17 @@ def run_ply_viewer(ply_path, port=8080):
             centers=np.ascontiguousarray(means),
             covariances=np.ascontiguousarray(covs),
             rgbs=np.ascontiguousarray(colors),
-            opacities=np.ascontiguousarray(opacities.reshape(-1, 1)), # Reshape to (N, 1) per assertion
+            opacities=np.ascontiguousarray(opacities.reshape(-1, 1)),
             visible=True,
         )
         
-        # Make it look nice
-        # Try looking from +Z for OpenCV style (Y down)
-        client.camera.position = (0.0, 0.0, -5.0) # Back up along Z
+        # Initial camera view: room dataset is often centered around (0,0,0) or shifted.
+        # Looking from a slight offset to see the structure.
+        client.camera.position = (0.0, 0.0, 3.0) 
         client.camera.look_at = (0.0, 0.0, 0.0)
-        client.camera.up_direction = (0.0, -1.0, 0.0) # Y is down in COLMAP/OpenCV
+        client.camera.up_direction = (0.0, -1.0, 0.0) # Y-down coordinate system
 
-    print("Viewer running... Press Ctrl+C to stop.")
+    print(f"Viewer running on http://localhost:{port}... Press Ctrl+C to stop.")
     while True:
         time.sleep(1.0)
 
