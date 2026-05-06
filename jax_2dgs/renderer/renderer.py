@@ -5,7 +5,7 @@ from jax_2dgs.renderer.projection_2d import project_gaussians_2d
 from jax_gs.renderer.rasterizer import get_tile_interactions, TILE_SIZE
 from jax_2dgs.renderer.rasterizer_2d import render_tiles_2d
 
-def render(gaussians: Gaussians2D, camera: Camera, background=jnp.array([0.0, 0.0, 0.0])):
+def render(gaussians: Gaussians2D, camera: Camera, background=None):
     """
     Main entry point for 2DGS rendering.
 
@@ -17,6 +17,9 @@ def render(gaussians: Gaussians2D, camera: Camera, background=jnp.array([0.0, 0.
         image: Rendered image
         extras: Optional dictionary with auxiliary maps (depth, normals, etc.)
     """
+    if background is None:
+        background = jnp.zeros((3,), dtype=jnp.float32)
+
     # 1. Project 2D Gaussians
     means2D, cov2D, radii, valid_mask, depths, normals = project_gaussians_2d(gaussians, camera)
     

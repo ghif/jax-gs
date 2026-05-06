@@ -16,12 +16,20 @@ def mse_loss(pred, target):
 def ssim(img1, img2, window_size=11, size_average=True):
     """
     Structural Similarity Index Measure.
-    Separable version for Gaussian Splatting (fixed window, uniform kernel).
+    Separable version for Gaussian Splatting (Gaussian window).
     """
     channel = img1.shape[-1]
     
-    # Separable Gaussian Window (1D)
-    window_1d = jnp.ones((window_size, 1, 1, channel)) / window_size
+    # 1D Gaussian kernel
+    def gaussian_kernel(size, sigma):
+        x = jnp.arange(size) - size // 2
+        kernel = jnp.exp(-x**2 / (2 * sigma**2))
+        return kernel / kernel.sum()
+
+    kernel_1d = gaussian_kernel(window_size, 1.5)
+    window_1d = kernel_1d[:, None, None, None] # [window_size, 1, 1, 1]
+    # Broadcast to channels
+    window_1d = jnp.tile(window_1d, (1, 1, 1, channel))
     
     def blur(img):
         # Vertical pass

@@ -4,10 +4,13 @@ from typing import Tuple
 from jax_gs.renderer.rasterizer import get_tile_interactions, TILE_SIZE, BLOCK_SIZE
 
 def render_tiles_2d(means2D, cov2D, opacities, colors, depths, normals, sorted_tile_ids, sorted_gaussian_ids, 
-                    H, W, tile_size: int = TILE_SIZE, background=jnp.array([0.0, 0.0, 0.0])):
+                    H, W, tile_size: int = TILE_SIZE, background=None):
     """
     Render the tiles for 2DGS. Outputs color, depth, and normal maps.
     """
+    if background is None:
+        background = jnp.zeros((3,), dtype=jnp.float32)
+
     num_tiles_x = (W + tile_size - 1) // tile_size
     num_tiles_y = (H + tile_size - 1) // tile_size
     num_tiles = num_tiles_x * num_tiles_y

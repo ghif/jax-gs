@@ -4,6 +4,7 @@ from typing import Tuple
 
 # Standard Constants
 TILE_SIZE = 16  # Each tile is 16x16 pixels
+OFFSET_SIZE = 16  # Max tile span tracked per Gaussian in each axis.
 BLOCK_SIZE = 512  # Increased from 192 to 512 to reduce blocky artifacts on datasets with high depth complexity
 
 def get_tile_interactions(means2D, radii, valid_mask, depths, H, W, tile_size: int = TILE_SIZE):
@@ -50,7 +51,6 @@ def get_tile_interactions(means2D, radii, valid_mask, depths, H, W, tile_size: i
     # Pre-calculate relative tile offsets for broadcasting.
     # OFFSET_SIZE defines the max size of a Gaussian in tiles (16 tiles = 256 pixels).
     # We use a static meshgrid to assign Gaussians to multiple tiles simultaneously.
-    OFFSET_SIZE = 16
     off_y, off_x = jnp.meshgrid(jnp.arange(OFFSET_SIZE), jnp.arange(OFFSET_SIZE), indexing='ij')
     off_x = off_x.flatten()
     off_y = off_y.flatten()
@@ -115,7 +115,7 @@ def get_tile_interactions(means2D, radii, valid_mask, depths, H, W, tile_size: i
 
     
 def render_tiles(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaussian_ids, 
-                 H, W, tile_size: int = TILE_SIZE, background=jnp.array([0.0, 0.0, 0.0])):
+                 H, W, tile_size: int = TILE_SIZE, background=None):
     """
     Renders the image by processing each tile and alpha-blending the overlapping Gaussians.
     
@@ -134,6 +134,8 @@ def render_tiles(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaus
     Returns:
         image: [H, W, 3] The rendered image.
     """
+    if background is None:
+        background = jnp.zeros((3,), dtype=jnp.float32)
     
     num_tiles_x = (W + tile_size - 1) // tile_size
     num_tiles_y = (H + tile_size - 1) // tile_size

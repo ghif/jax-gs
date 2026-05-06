@@ -15,11 +15,11 @@ def _compute_loss_and_metrics(params, target_image, w2c, camera_static, fast_tpu
     W, H, fx, fy, cx, cy = camera_static
     camera = Camera(W=W, H=H, fx=fx, fy=fy, cx=cx, cy=cy, W2C=w2c, full_proj=jnp.eye(4))
     
-    lambda_ssim = 0.4
-    
+    lambda_ssim = 0.2
+
     # We pass the active mask to the renderer so it ignores inactive padded Gaussians.
     image, extras = render(params, camera, fast_tpu_rasterizer=fast_tpu_rasterizer, mask=active_mask, sh_degree=sh_degree)
-    
+
     l1 = l1_loss(image, target_image)
     d_ssim = d_ssim_loss(image, target_image)
 
@@ -27,8 +27,15 @@ def _compute_loss_and_metrics(params, target_image, w2c, camera_static, fast_tpu
 
     metrics = {
         "l1": l1,
-        "ssim": 1.0 - d_ssim * 2.0
+        "ssim": 1.0 - d_ssim * 2.0,
+        "n_interactions": extras["n_interactions"].astype(jnp.float32),
+        "mean_interactions_per_tile": extras["mean_interactions_per_tile"].astype(jnp.float32),
+        "max_interactions_per_tile": extras["max_interactions_per_tile"].astype(jnp.float32),
+        "overflow_tiles": extras["overflow_tiles"].astype(jnp.float32),
+        "overflow_interactions": extras["overflow_interactions"].astype(jnp.float32),
+        "radius_cap_violations": extras["radius_cap_violations"].astype(jnp.float32),
     }
+
 
     return total_loss, (metrics, extras)
 
@@ -80,16 +87,17 @@ def train_step_internal(state: DensityState, target_image, w2c, camera_static, o
     grad_means3D = grads.means
     grad_norm_3d = jnp.linalg.norm(grad_means3D, axis=-1)
     
-    # Scale by W * H to compensate for jnp.mean() loss normalization.
+    # Scale by W * H * 3 to compensate for jnp.mean() loss normalization.
     # This makes the gradient magnitude consistent with sum-over-pixels expected by paper.
-    grad_2d_mag = grad_norm_3d * (z / focal) * (float(W) * float(H))
+    grad_2d_mag = grad_norm_3d * (z / focal) * (float(W) * float(H) * 3.0)
     
     # Average across batch/devices
     grad_2d_mag = jax.lax.pmean(grad_2d_mag, axis_name='batch')
     
     # Update accumulators
     next_grad_accum = state.grad_accum + grad_2d_mag
-    next_denom = state.denom + jnp.where(active, 1, 0)
+    visible = extras["valid_mask"] & active
+    next_denom = state.denom + jnp.where(visible, 1, 0)
     
     # Update max radii (only for validly projected Gaussians)
     radii = extras["radii"]
@@ -136,11 +144,12 @@ def train_step(state: DensityState, target_image, w2c, camera_static, optimizer,
     means_cam = (means3D_homo @ camera.W2C.T)[:, :3]
     z = jnp.maximum(means_cam[:, 2], 0.01)
     focal = (fx + fy) / 2.0
-    # Scale by W * H to compensate for jnp.mean() loss normalization.
-    grad_2d_mag = jnp.linalg.norm(grads.means, axis=-1) * (z / focal) * (float(W) * float(H))
+    # Scale by W * H * 3 to compensate for jnp.mean() loss normalization.
+    grad_2d_mag = jnp.linalg.norm(grads.means, axis=-1) * (z / focal) * (float(W) * float(H) * 3.0)
     
     next_grad_accum = state.grad_accum + grad_2d_mag
-    next_denom = state.denom + jnp.where(active, 1, 0)
+    visible = extras["valid_mask"] & active
+    next_denom = state.denom + jnp.where(visible, 1, 0)
     
     # Update max radii (only for validly projected Gaussians)
     radii = extras["radii"]

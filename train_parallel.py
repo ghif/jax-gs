@@ -42,8 +42,8 @@ def train_block(state, rng_key, all_targets, all_w2cs, steps_per_block, camera_s
 @partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(2,))
 def pmap_density_step(state, rng_key, extent):
     rng_key, subkey = jax.random.split(rng_key)
-    # Lower grad_threshold (0.000005) to account for jnp.mean() loss normalization
-    state = densify_and_prune(state, subkey, extent=extent, grad_threshold=0.000005)
+    # Using paper default (0.0002) as trainer.py now correctly handles normalization compensation.
+    state = densify_and_prune(state, subkey, extent=extent, grad_threshold=0.0002)
     return state, rng_key
 
 @partial(jax.pmap, axis_name='batch')
@@ -118,8 +118,9 @@ def run_parallel_training(num_iterations: int = 30000,
     
     # 3. Setup Optimizer and DensityState
     # Parameter-specific learning rates
-    means_lr_init = 0.00016 * extent
-    means_lr_end = 0.0000016 * extent
+    # Increased by 3x for faster convergence with JAX.
+    means_lr_init = 0.00016 * extent * 3.0
+    means_lr_end = 0.0000016 * extent * 3.0
     means_lr_schedule = optax.exponential_decay(
         init_value=means_lr_init,
         transition_steps=num_iterations,
@@ -148,8 +149,8 @@ def run_parallel_training(num_iterations: int = 30000,
     
     print(f"Using 3DGS multi-parameter optimizer (Means LR: {means_lr_init:.2e} -> {means_lr_end:.2e})")
     
-    # Recommendation 4: Dynamic max_gaussians (Allow 10x growth, cap at 500k)
-    max_gaussians = min(len(xyz) * 10, 500_000)
+    # Recommendation 4: Dynamic max_gaussians (Allow 20x growth, cap at 1M)
+    max_gaussians = min(max(len(xyz) * 20, 500_000), 1_000_000)
     print(f"Initializing DensityState with dynamic max_gaussians={max_gaussians} (initial: {len(xyz)})")
     state = init_density_state(gaussians, optimizer, max_gaussians)
     

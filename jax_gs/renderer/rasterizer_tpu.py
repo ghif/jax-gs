@@ -99,11 +99,11 @@ def render_tiles_tpu(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_
         power = jnp.where(is_active_local, power, -100.0)
         
         # Compute alpha influence
-        alpha = jnp.where(power > -10.0, jnp.exp(jnp.clip(power, -100.0, 0.0)) * op, 0.0)
+        alpha = jnp.exp(power) * op
         
         # Combine local existence mask and transmittance threshold
         is_active = is_active_local & (T > 1e-4)
-        alpha = jnp.where(is_active, jnp.minimum(0.99, alpha), 0.0)
+        alpha = jnp.where((power > -10.0) & is_active, jnp.minimum(0.99, alpha), 0.0)
         
         # Update color and transmittance
         weight = alpha * T
