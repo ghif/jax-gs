@@ -230,8 +230,9 @@ def run_parallel_training(
         sh_degree = curr_sh_degree
 
         rng, block_rng = jax.random.split(rng)
-        per_device_rng = jax.random.split(block_rng, num_devices)
-        sharded_rng = jax.device_put_sharded(list(per_device_rng), devices)
+        # pmap shards leading-axis array arguments across devices. The older
+        # device_put_sharded helper was removed in recent JAX versions.
+        sharded_rng = jax.random.split(block_rng, num_devices)
 
         block_start = time.perf_counter()
         curr_state, losses, block_metrics = train_block(
