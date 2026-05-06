@@ -61,6 +61,7 @@ def run_training(num_iterations: int = 30000,
                  output_base: str = "gs://dataset-nerf/results",
                  fast_tpu_rasterizer: bool = False,
                  images_subdir: str = "images_8",
+                 steps_per_block: int = 100,
                  max_gaussians_cap: int = 200_000,
                  max_gaussians_growth: int = 8,
                  density_interval: int = 500,
@@ -194,8 +195,9 @@ def run_training(num_iterations: int = 30000,
         os.makedirs(progress_dir, exist_ok=True)
         os.makedirs(ply_dir, exist_ok=True)
 
-    # We use blocks of 100 to allow frequent density control
-    steps_per_block = 100
+    # Smaller benchmark blocks reduce TPU compile memory and let callers trade
+    # off compile cost vs. timing granularity.
+    steps_per_block = max(1, int(steps_per_block))
     num_blocks = num_iterations // steps_per_block
     
     pbar = tqdm(range(num_blocks))
@@ -319,6 +321,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="gs://dataset-nerf/nerf_llff_data/fern")
     parser.add_argument("--output_path", type=str, default="gs://dataset-nerf/results")
     parser.add_argument("--images_subdir", type=str, default="images_8")
+    parser.add_argument("--steps_per_block", type=int, default=100, help="Number of training steps compiled into each timed block")
     parser.add_argument("--fast_tpu_rasterizer", action="store_true", help="Use the optimized JAX scan rasterizer for TPU")
     parser.add_argument("--max_gaussians_cap", type=int, default=200_000, help="Upper bound for padded Gaussian capacity")
     parser.add_argument("--max_gaussians_growth", type=int, default=8, help="Capacity multiplier applied to the initial COLMAP point count")
@@ -335,6 +338,7 @@ if __name__ == "__main__":
                  data_path=args.data_path, output_base=args.output_path,
                  fast_tpu_rasterizer=args.fast_tpu_rasterizer,
                  images_subdir=args.images_subdir,
+                 steps_per_block=args.steps_per_block,
                  max_gaussians_cap=args.max_gaussians_cap,
                  max_gaussians_growth=args.max_gaussians_growth,
                  density_interval=args.density_interval,

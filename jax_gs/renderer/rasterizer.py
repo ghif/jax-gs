@@ -186,12 +186,8 @@ def render_tiles(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaus
                 def do_chunk(chunk_carry):
                     accum_color, T = chunk_carry
                     chunk_start = start_idx + chunk_idx * BLOCK_SIZE
-                    gather_indices = jnp.clip(
-                        chunk_start + jnp.arange(BLOCK_SIZE),
-                        0,
-                        sorted_gaussian_ids.shape[0] - 1
-                    )
-                    indices = jnp.take(sorted_gaussian_ids, gather_indices)
+                    gather_start = jnp.clip(chunk_start, 0, jnp.maximum(0, sorted_gaussian_ids.shape[0] - BLOCK_SIZE))
+                    indices = jax.lax.dynamic_slice(sorted_gaussian_ids, (gather_start,), (BLOCK_SIZE,))
                     local_mask = (chunk_idx * BLOCK_SIZE + jnp.arange(BLOCK_SIZE)) < count
 
                     t_means = means2D[indices]
@@ -204,6 +200,7 @@ def render_tiles(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaus
                     t_op_vec = t_ops[:, 0]
 
                     def blend_pixel(p_color, p_T, p_coord, p_valid):
+                        @jax.checkpoint
                         def scan_fn(inner_carry, i):
                             accum_c, trans = inner_carry
                             is_active = local_mask[i] & (trans > 1e-4)
@@ -239,8 +236,9 @@ def render_tiles(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaus
 
         return jax.lax.cond(count > 0, process_tile, empty_tile)
 
-    # Parallelize over all tiles in the image
-    all_tiles = jax.vmap(rasterize_single_tile)(jnp.arange(num_tiles))
+    # Use jax.lax.map (sequential/loop) instead of vmap (parallel) to avoid OOM on TPU
+    # as vmap over tiles triggers massive broadcasts of interaction and parameter arrays.
+    all_tiles = jax.lax.map(rasterize_single_tile, jnp.arange(num_tiles))
     
     # Reshape tiles back into the full image
     output_grid = all_tiles.reshape(num_tiles_y, num_tiles_x, tile_size, tile_size, 3)

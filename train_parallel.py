@@ -196,7 +196,7 @@ def run_parallel_training(
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     rasterizer_suffix = "_fast_tpu" if fast_tpu_rasterizer else ""
-    output_dir = f"{output_base}/{scene_name}_3dgs{rasterizer_suffix}_{timestamp}"
+    output_dir = f"{output_base}/{scene_name}_parallel_3dgs{rasterizer_suffix}_{timestamp}"
 
     fs, _ = fsspec.core.url_to_fs(output_dir)
     if fs.protocol == "file" or (isinstance(fs.protocol, (list, tuple)) and "file" in fs.protocol):
