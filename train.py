@@ -63,7 +63,13 @@ def run_training(num_iterations: int = 30000,
                  images_subdir: str = "images_8",
                  max_gaussians_cap: int = 200_000,
                  max_gaussians_growth: int = 8,
-                 density_interval: int = 500):
+                 density_interval: int = 500,
+                 max_overflow_tiles: int = 64,
+                 max_overflow_interactions: int = 10_000,
+                 max_radius_cap_violations: int = 16,
+                 max_truncated_tiles: int = 0,
+                 max_truncated_interactions: int = 0,
+                 sh_promotion_mode: str = "health_gated"):
     
     # Infer scene name from path
     scene_name = os.path.basename(data_path.rstrip('/'))
@@ -71,6 +77,7 @@ def run_training(num_iterations: int = 30000,
     print(f"Fast TPU Rasterizer: {fast_tpu_rasterizer}")
     density_interval = max(1, density_interval)
     max_gaussians_growth = max(1, max_gaussians_growth)
+    sh_promotion_mode = sh_promotion_mode.lower()
 
     init_fn = init_gaussians_from_pcd
 
@@ -95,6 +102,8 @@ def run_training(num_iterations: int = 30000,
         avg_metrics["max_interactions_per_tile"] = jnp.max(metrics["max_interactions_per_tile"])
         avg_metrics["overflow_tiles"] = jnp.max(metrics["overflow_tiles"])
         avg_metrics["overflow_interactions"] = jnp.max(metrics["overflow_interactions"])
+        avg_metrics["truncated_tiles"] = jnp.max(metrics["truncated_tiles"])
+        avg_metrics["truncated_interactions"] = jnp.max(metrics["truncated_interactions"])
         avg_metrics["radius_cap_violations"] = jnp.max(metrics["radius_cap_violations"])
         return state, rng_key, losses, avg_metrics
         
@@ -155,9 +164,9 @@ def run_training(num_iterations: int = 30000,
     state = init_density_state(gaussians, optimizer, max_gaussians)
     
     @jax.jit
-    def density_step(state, rng_key):
+    def density_step(state, rng_key, densify_enabled):
         # Using paper default (0.0002) as trainer.py already handles loss normalization compensation.
-        return densify_and_prune(state, rng_key, extent=extent, grad_threshold=0.0002)
+        return densify_and_prune(state, rng_key, densify_enabled=densify_enabled, extent=extent, grad_threshold=0.0002)
         
     @jax.jit
     def opacity_reset_step(state):
@@ -196,15 +205,15 @@ def run_training(num_iterations: int = 30000,
     
     curr_state = state
     curr_rng = rng
+    curr_sh_degree = 0
 
     # Background executor for I/O and rendering
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     futures = []
 
     for b in pbar:
-        # SH Degree Scheduling: Increase degree every 1000 iterations (approx)
         curr_iter = b * steps_per_block
-        sh_degree = min(3, curr_iter // 1000)
+        sh_degree = curr_sh_degree
 
         block_start = time.perf_counter()
         curr_state, curr_rng, losses, block_metrics = train_block(
@@ -220,12 +229,21 @@ def run_training(num_iterations: int = 30000,
         curr_iter = (b + 1) * steps_per_block
         density_time = 0.0
         reset_time = 0.0
+        quality_healthy = (
+            block_metrics["overflow_tiles"] <= max_overflow_tiles and
+            block_metrics["overflow_interactions"] <= max_overflow_interactions and
+            block_metrics["radius_cap_violations"] <= max_radius_cap_violations and
+            block_metrics["truncated_tiles"] <= max_truncated_tiles and
+            block_metrics["truncated_interactions"] <= max_truncated_interactions
+        )
+        quality_status = "ok" if quality_healthy else "hold"
+        densify_enabled = quality_healthy and (block_metrics["truncated_tiles"] == 0.0)
         
         # Adaptive Density Control
         if 500 < curr_iter <= 15000 and curr_iter % density_interval == 0:
             curr_rng, density_rng = jax.random.split(curr_rng)
             density_start = time.perf_counter()
-            curr_state = density_step(curr_state, density_rng)
+            curr_state = density_step(curr_state, density_rng, densify_enabled)
             jax.block_until_ready(curr_state.active_mask.sum())
             density_time = time.perf_counter() - density_start
             
@@ -238,9 +256,19 @@ def run_training(num_iterations: int = 30000,
                 
         num_active = int(jax.block_until_ready(curr_state.active_mask.sum()))
         it_per_sec = steps_per_block / block_time if block_time > 0 else 0.0
+        desired_sh_degree = min(3, curr_iter // 1000)
+        sh_promoted = False
+        if sh_promotion_mode == "always":
+            next_sh_degree = desired_sh_degree
+        elif quality_healthy and desired_sh_degree > curr_sh_degree:
+            next_sh_degree = curr_sh_degree + 1
+            sh_promoted = True
+        else:
+            next_sh_degree = curr_sh_degree
+        curr_sh_degree = min(3, next_sh_degree)
         pbar.set_description(
             f"Loss: {avg_loss:.4f} | Active: {num_active}/{max_gaussians} | "
-            f"SH: {sh_degree} | {it_per_sec:.1f} it/s"
+            f"SH: {sh_degree} | {quality_status} | {it_per_sec:.1f} it/s"
         )
         if b % 10 == 0 or density_time > 0.0 or reset_time > 0.0:
             print(
@@ -248,12 +276,15 @@ def run_training(num_iterations: int = 30000,
                 f"L1: {block_metrics['l1']:.4f} | SSIM: {block_metrics['ssim']:.4f} | "
                 f"Active: {num_active}/{max_gaussians} | SH: {sh_degree} | "
                 f"Train: {block_time:.3f}s ({it_per_sec:.1f} it/s) | "
-                f"Density: {density_time:.3f}s | Reset: {reset_time:.3f}s | "
+                f"Density: {density_time:.3f}s ({'on' if densify_enabled else 'prune-only'}) | Reset: {reset_time:.3f}s | "
                 f"Interactions avg/max: {block_metrics['mean_interactions_per_tile']:.1f}/"
                 f"{block_metrics['max_interactions_per_tile']:.0f} | "
                 f"Overflow tiles/interactions: {block_metrics['overflow_tiles']:.0f}/"
                 f"{block_metrics['overflow_interactions']:.0f} | "
-                f"Radius cap: {block_metrics['radius_cap_violations']:.0f}"
+                f"Truncated tiles/interactions: {block_metrics['truncated_tiles']:.0f}/"
+                f"{block_metrics['truncated_interactions']:.0f} | "
+                f"Radius cap: {block_metrics['radius_cap_violations']:.0f} | "
+                f"Quality: {quality_status} | SH next: {curr_sh_degree}{' (promoted)' if sh_promoted else ''}"
             )
         
         if curr_iter % 1000 == 0:
@@ -292,6 +323,12 @@ if __name__ == "__main__":
     parser.add_argument("--max_gaussians_cap", type=int, default=200_000, help="Upper bound for padded Gaussian capacity")
     parser.add_argument("--max_gaussians_growth", type=int, default=8, help="Capacity multiplier applied to the initial COLMAP point count")
     parser.add_argument("--density_interval", type=int, default=500, help="Run densify/prune every N iterations during the density window")
+    parser.add_argument("--max_overflow_tiles", type=int, default=64, help="Hold densification/SH promotion when more than this many tiles require multiple chunks")
+    parser.add_argument("--max_overflow_interactions", type=int, default=10000, help="Hold densification/SH promotion when multi-chunk interaction pressure exceeds this count")
+    parser.add_argument("--max_radius_cap_violations", type=int, default=16, help="Hold densification/SH promotion when too many projected splats exceed OFFSET_SIZE")
+    parser.add_argument("--max_truncated_tiles", type=int, default=0, help="Hold densification/SH promotion when any tiles exceed the hard multi-chunk interaction budget")
+    parser.add_argument("--max_truncated_interactions", type=int, default=0, help="Hold densification/SH promotion when hard interaction truncation is non-zero")
+    parser.add_argument("--sh_promotion_mode", type=str, default="health_gated", choices=["health_gated", "always"], help="Gate SH degree promotion on renderer health or use the fixed schedule")
     args = parser.parse_args()
     
     run_training(num_iterations=args.num_iterations, 
@@ -300,4 +337,10 @@ if __name__ == "__main__":
                  images_subdir=args.images_subdir,
                  max_gaussians_cap=args.max_gaussians_cap,
                  max_gaussians_growth=args.max_gaussians_growth,
-                 density_interval=args.density_interval)
+                 density_interval=args.density_interval,
+                 max_overflow_tiles=args.max_overflow_tiles,
+                 max_overflow_interactions=args.max_overflow_interactions,
+                 max_radius_cap_violations=args.max_radius_cap_violations,
+                 max_truncated_tiles=args.max_truncated_tiles,
+                 max_truncated_interactions=args.max_truncated_interactions,
+                 sh_promotion_mode=args.sh_promotion_mode)

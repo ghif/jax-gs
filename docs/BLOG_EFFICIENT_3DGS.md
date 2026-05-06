@@ -1,174 +1,84 @@
-# Efficient 3D Gaussian Splatting in JAX: From Naive Loops to TPU Saturation
+# Efficient 3D Gaussian Splatting in JAX-GS
 
-3D Gaussian Splatting (3DGS) has revolutionized real-time radiance field rendering. However, training these models efficiently requires more than just porting CUDA kernels to Python. In this article, we explore how we optimized a 3DGS training pipeline in JAX, moving from a naive implementation that left hardware idling to a highly optimized system that fully saturates Google's Tensor Processing Units (TPUs).
+## A Static-Shape Reinterpretation of Kerbl et al. (2023)
 
----
+### Abstract
 
-## 1. Understanding Google's TPU Technology
-
-To understand our optimizations, we must first understand the target hardware. Google's **Tensor Processing Units (TPUs)** are application-specific integrated circuits (ASICs) designed from the ground up to accelerate machine learning workloads.
-
-### **A Brief History of TPUs**
-Since their secret debut in 2015, TPUs have evolved from specialized inference engines into the backbone of global AI:
-*   **TPU v1 (2015):** A pure inference chip that powered Google Search and AlphaGo.
-*   **TPU v2 (2017):** The first version capable of training, introducing the **bfloat16** format.
-*   **TPU v3 (2018):** Doubled performance and introduced **liquid cooling** to handle the heat of massive scale.
-*   **TPU v4 (2021):** Introduced **3D Torus** network topology and **SparseCore** for embedding acceleration.
-*   **TPU v5 (2023):** Split into **v5e** (Efficient/Cost-optimized) and **v5p** (Performance flagship for models like Gemini).
-*   **Trillium / TPU v6e (2024):** The latest generation, featuring a 256x256 MXU and 4.7x the peak compute of v5e.
-*   **Ironwood / TPU7x (2025):** Employs a **dual-chiplet** architecture and 192GB of HBM3e, optimized for massive-scale inference and frontier "reasoning" models.
-
-### **Architectural Highlights**
-Unlike general-purpose GPUs, TPUs are built around **Matrix Multiply Units (MXUs)**. These hardware blocks use a **systolic array** design to perform massive matrix multiplications with incredibly high throughput. 
-
-| Version | Key Innovation | Topology | Memory |
-| :--- | :--- | :--- | :--- |
-| **v3** | Liquid Cooling | 2D Torus | 32 GB |
-| **v4** | SparseCore | 3D Torus | 32 GB |
-| **v5e** | Cost Efficiency | 2D Torus | 16 GB |
-| **v5p** | Frontier Scale | 3D Torus | 95 GB |
-| **v6e** | Trillium Arch | 2D Torus | 32 GB |
-| **Ironwood** | Dual-Chiplet | 3D Torus | 192 GB |
-
-To achieve this performance, the TPU needs a constant, uninterrupted stream of data. JAX, combined with the **XLA (Accelerated Linear Algebra)** compiler, allows us to write high-level Python code that is compiled into a single, optimized "graph" for the TPU. If our code frequently jumps back to Python or waits for the CPU, the TPU's MXUs sit idle—a state known as being "host-bound." Our optimizations focus on breaking this host-bound barrier.
+This note documents the current `jax-gs` implementation of 3D Gaussian Splatting (3DGS) after the recent convergence and systems updates. The core objective remains the same as Kerbl et al. (2023): optimize anisotropic 3D Gaussians with interleaved densification, pruning, and spherical harmonics (SH) color fitting. The main departure is implementation strategy. Instead of a PyTorch training loop coupled to custom CUDA rasterization, `jax-gs` reformulates the pipeline as pure JAX/XLA programs with static-shape state, block-compiled optimization, and hardware-specific rasterization paths for standard accelerators and TPUs. Recent code changes focus less on raw throughput claims and more on maintaining numerical and structural stability under JIT compilation: masked rendering of inactive padded slots, optimizer-state reordering during densification, gradient rescaling for density heuristics, interaction-pressure metrics from the renderer, and health-gated SH promotion and densification.
 
 ---
 
-## 2. The Bottleneck: The Naive Approach
+## 1. Motivation
 
-Our initial implementation followed a traditional deep learning training loop structure familiar to many PyTorch users:
+Kerbl et al. showed that explicit 3D Gaussians can replace neural volume integration while preserving high visual quality and real-time rendering. However, the original implementation assumes a systems stack that is natural for CUDA: variable-length point sets, custom rasterization kernels, and dynamic memory movement during clone/split/prune operations. Those assumptions do not transfer directly to JAX, where high performance depends on static array shapes and compiling large regions of the program into a single XLA graph.
+
+The current `jax-gs` codebase therefore solves a different engineering problem:
+
+1. Preserve the optimization logic of 3DGS.
+2. Express the full renderer and training loop in pure JAX.
+3. Keep the state JIT-compatible despite adaptive density control.
+4. Add explicit quality guards so densification does not destabilize the tiled rasterizer.
+
+---
+
+## 2. System Overview
+
+At a high level, the implementation is organized around four stages:
+
+1. A padded Gaussian state in `jax_gs/training/density.py`.
+2. Projection, tile assignment, sorting, and rasterization in `jax_gs/renderer/`.
+3. A block-compiled training loop in `train.py` or `train_parallel.py`.
+4. Asynchronous host-side artifact export for progress images and `.ply` snapshots.
+
+The most important systems decision is that Gaussian count is treated as a fixed-capacity buffer rather than a dynamically resized list. This single choice drives most of the subsequent design.
+
+---
+
+## 3. Core Training Formulation
+
+### 3.1 Block-Compiled Optimization
+
+The single-device trainer no longer dispatches one optimizer step at a time from Python. Instead, it samples a block of camera indices on device and executes the block with `jax.lax.scan`.
 
 ```python
-# The Naive Loop
-for i in pbar:
-    idx = random.randint(0, len(jax_cameras)-1)
-    cam = jax_cameras[idx]
-    target = jax_targets[idx]
-    
-    # Single step dispatched to device
-    state, loss, metrics = train_step(state, target, cam.W2C, camera_static, optimizer)
-    
-    if i % 100 == 0:
-        img = render(state[0], jax_cameras[0]) # Synchronous render
-        save_ply(...) # Synchronous I/O
-```
-
-This approach has three fatal performance flaws:
-1.  **Dispatch Overhead**: Python has to tell the TPU what to do for every single step.
-2.  **Host-Device Communication**: Picking random images on the CPU and sending them to the TPU creates a bottleneck.
-3.  **Synchronous I/O**: The entire training process stops to wait for disk writes.
-
----
-
-## 3. Optimization 1: JIT-Compiled Training Blocks
-
-The first breakthrough was moving the loop itself onto the TPU using `jax.lax.scan`. Instead of running one step at a time, we compiled a "block" of 100 steps.
-
-```python
-# From train.py
 @partial(jax.jit, static_argnums=(4, 5, 6, 7, 8))
-def train_block(state, rng_key, all_targets, all_w2cs, steps_per_block, camera_static, optimizer, fast_tpu_rasterizer, sh_degree):
-    def one_step(carry, _):
-        state, key = carry
-        key, subkey = jax.random.split(key)
-        
-        # Sample camera index
-        idx = jax.random.randint(subkey, (), 0, all_targets.shape[0])
-        target = all_targets[idx]
-        w2c = all_w2cs[idx]
-        
-        # Perform training step
-        state, loss, metrics = train_step(state, target, w2c, camera_static, optimizer, fast_tpu_rasterizer=fast_tpu_rasterizer, sh_degree=sh_degree)
-        
-        return (state, key), loss
+def train_block(state, rng_key, all_targets, all_w2cs,
+                steps_per_block, camera_static, optimizer,
+                fast_tpu_rasterizer, sh_degree):
+    rng_key, subkey = jax.random.split(rng_key)
+    idxs = jax.random.randint(subkey, (steps_per_block,), 0, all_targets.shape[0])
+    batch_targets = all_targets[idxs]
+    batch_w2cs = all_w2cs[idxs]
 
-    # The entire loop runs on the TPU as a single XLA program
-    (state, rng_key), losses = jax.lax.scan(one_step, (state, rng_key), None, length=steps_per_block)
-    return state, rng_key, losses
+    def one_step(carry, inputs):
+        state = carry
+        target, w2c = inputs
+        state, loss, metrics = train_step(
+            state, target, w2c, camera_static, optimizer,
+            fast_tpu_rasterizer=fast_tpu_rasterizer,
+            sh_degree=sh_degree,
+        )
+        return state, (loss, metrics)
+
+    state, (losses, metrics) = jax.lax.scan(one_step, state, (batch_targets, batch_w2cs))
+    return state, rng_key, losses, metrics
 ```
 
-This effectively deletes dispatch overhead from the performance equation. The TPU runs for 100 iterations without ever looking back at the host.
+This is a direct response to the JAX execution model. In Kerbl et al., per-step Python control is not itself the bottleneck because the heavy work happens in CUDA kernels. In `jax-gs`, leaving the loop on the host would reintroduce dispatch overhead and fragment compilation.
 
----
+### 3.2 Parameter-Specific Optimization
 
-## 4. Optimization 2: On-Device Data & Sampling
-
-To solve the communication bottleneck, we load all training images and camera matrices onto the TPU memory upfront. Indices are generated on the TPU using `jax.random.randint`, resulting in **zero data transfer** during training blocks.
+The optimizer follows the 3DGS idea of parameter-group-specific learning rates, but the current implementation uses an exponential decay schedule for positions and tuned constants for the remaining parameter groups.
 
 ```python
-# From train.py
-# 1. Prepare data on device (all images and matrices loaded once)
-all_targets = jnp.stack(jax_targets)
-all_w2cs = jnp.stack([c.W2C for c in jax_cameras])
+means_lr_init = 0.00016 * extent * 3.0
+means_lr_end = 0.0000016 * extent * 3.0
+means_lr_schedule = optax.exponential_decay(
+    init_value=means_lr_init,
+    transition_steps=num_iterations,
+    decay_rate=means_lr_end / means_lr_init,
+)
 
-# 2. Inside the JIT-compiled train_block:
-# Sampling happens entirely on-device
-idx = jax.random.randint(subkey, (), 0, all_targets.shape[0])
-target = all_targets[idx]
-w2c = all_w2cs[idx]
-```
-
----
-
-## 5. Optimization 3: Asynchronous I/O
-
-We use a background `ThreadPoolExecutor` to handle logging and checkpointing. While the TPU is busy with the next training block, the CPU thread takes a "snapshot" of the Gaussians, renders a progress image, and writes the `.ply` file. The training loop never pauses.
-
-```python
-# From train.py
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-
-for b in pbar:
-    # TPU is busy executing the next block...
-    curr_state, curr_rng, losses = train_block(...)
-
-    # Dispatch I/O to background thread without blocking the TPU
-    def save_async(state_snapshot, path):
-        save_ply(state_snapshot.gaussians, path)
-        
-    executor.submit(save_async, jax.device_get(curr_state), ply_path)
-```
-
----
-
-## 6. Optimization 4: JIT-Compatible Adaptive Density Control
-
-3DGS requires dynamically cloning, splitting, and pruning Gaussians. However, JIT-compiled functions require **static array shapes**. Our solution is the **Padded Buffer Strategy**:
-
-1.  **Fixed-Size State**: We initialize a `DensityState` with a fixed buffer (e.g., 200,000 slots).
-2.  **Active Mask**: A boolean mask tracks which slots contain valid Gaussians.
-3.  **Vectorized Routing**: Instead of dynamic slicing, we use `jnp.argsort` on masks to "pack" valid indices and scatter new Gaussians into empty slots—all within a statically-shaped XLA graph.
-
-```python
-# From jax_gs/training/density.py
-# --- Vectorized Routing ---
-# Compact indices for sources and destinations using argsort
-empty_indices = jnp.argsort((~will_be_empty).astype(jnp.int8))
-clone_src_indices = jnp.argsort((~clone_mask).astype(jnp.int8))
-split_src_indices = jnp.argsort((~split_mask).astype(jnp.int8))
-
-# Identify which source to read for each empty slot
-src_to_read = jnp.where(is_clone_dest, clone_src_indices[idx], 0)
-src_to_read = jnp.where(is_split_dest, split_src_indices[idx - num_clones], src_to_read)
-
-# Execute Data Movement with static shapes
-gather_indices = jnp.arange(MAX_GAUSSIANS)
-gather_indices = gather_indices.at[empty_indices].set(new_values)
-new_means = g.means[gather_indices]
-```
-
-4.  **Optimizer Synchronization**: Crucially, we use `jax.tree_util.tree_map` to reorder the **optimizer momentum buffers** (mu, nu) whenever Gaussians are moved. This keeps the optimization history in perfect sync with the geometry.
-
----
-
-## 7. Optimization 5: Sophisticated Radiance Field Tuning
-
-To handle complex indoor scenes like the "room" dataset, we implemented advanced radiance field optimization techniques:
-
-*   **Multi-Parameter Optimization**: Using `optax.multi_transform`, we apply different learning rates to different parameters. Opacities get a high LR (`0.05`) for fast convergence, while positions (`means`) use a scene-scaled exponential decay.
-
-```python
-# From train.py
 optimizer = optax.multi_transform(
     {
         "means": optax.adam(learning_rate=means_lr_schedule),
@@ -177,127 +87,316 @@ optimizer = optax.multi_transform(
         "opacities": optax.adam(learning_rate=0.05),
         "sh_coeffs": optax.adam(learning_rate=0.0025),
     },
-    param_labels
+    param_labels,
 )
 ```
 
-*   **Gradient Rescaling**: JAX typically averages loss over pixels (`jnp.mean`). Since densification thresholds expect a sum-of-errors, we scale our accumulated positional gradients by the **total pixel count** ($H \times W$).
-*   **SH Degree Scheduling**: We start training at Degree 0 (diffuse only) and gradually increase view-dependency every 1,000 steps. This "geometric warmup" prevents early optimization instability.
-
-```python
-# From train.py
-for b in pbar:
-    # SH Degree Scheduling: Increase degree every 1000 iterations
-    curr_iter = b * steps_per_block
-    sh_degree = min(3, curr_iter // 1000)
-    curr_state, _, _ = train_block(..., sh_degree=sh_degree)
-```
-
-*   **Stable Radii Accumulation**: Gaussians are pruned if their 2D screen radius exceeds a threshold. However, computing the maximum radius across parallel devices (`jax.lax.pmax`) can be corrupted if a Gaussian passes too close to the camera plane ($z \approx 0$), causing an artificially massive radius. We strictly mask these invalid projections before updating the `max_radii` state to prevent erroneous, aggressive pruning.
-*   **Relaxed Screen Size Threshold**: The default threshold of 20 pixels used in many baseline implementations is too restrictive for modern high-resolution scenes. We increased the `max_screen_size` pruning threshold to `512` pixels, allowing geometry to naturally expand to capture large continuous regions (like walls or backgrounds).
-*   **Masked Rendering**: Our renderer strictly ignores inactive buffer slots during projection and sorting, dramatically reducing TPU memory pressure and noise.
+This is one of the recent stability changes: the code moved away from more aggressive scaling and back toward a schedule that decays smoothly over the full run.
 
 ---
 
-## 8. Optimization 6: Hardware-Specific Rasterization (CPU/GPU vs. TPU)
+## 4. Static-Shape Adaptive Density Control
 
-A critical realization during development was that the optimal JAX code for a GPU is not always the optimal code for a TPU. To maximize performance across platforms, we implemented two distinct rasterizers: `rasterizer.py` (standard) and `rasterizer_tpu.py` (TPU-optimized).
+### 4.1 Fixed-Capacity State
 
-The core differences lie in how they structure memory access and vectorization for the XLA compiler:
+The major algorithmic adaptation relative to the original 3DGS implementation is the introduction of `DensityState`, which holds:
 
-1.  **Vectorization Strategy (Nested vs. Flat)**:
-    *   **Standard (`rasterizer.py`)**: Uses a nested approach. It parallelizes over tiles using `jax.vmap`, and inside that, parallelizes over the 256 pixels within the tile using another `jax.vmap`. This is natural and works well on GPUs.
+- padded Gaussian parameters,
+- optimizer state,
+- an `active_mask`,
+- per-Gaussian gradient accumulators,
+- visibility counts,
+- maximum observed 2D radii.
 
 ```python
-# From jax_gs/renderer/rasterizer.py
-def rasterize_single_tile(tile_idx):
-    # ... logic for one tile ...
-    def blend_pixel(p_coord, p_valid):
-        # ... blending logic for one pixel ...
-        return final_color
-
-    # Parallelize over pixels in the tile
-    tile_image = jax.vmap(blend_pixel)(pixel_coords, pixel_valid)
-    return tile_image.reshape(tile_size, tile_size, 3)
-
-# Parallelize over all tiles in the image
-all_tiles = jax.vmap(rasterize_single_tile)(jnp.arange(num_tiles))
+@chex.dataclass
+class DensityState:
+    gaussians: Gaussians
+    opt_state: optax.OptState
+    active_mask: jnp.ndarray
+    num_active: jnp.ndarray
+    grad_accum: jnp.ndarray
+    denom: jnp.ndarray
+    max_radii: jnp.ndarray
 ```
 
-    *   **TPU (`rasterizer_tpu.py`)**: TPUs prefer massive, continuous matrix operations to saturate their Matrix Multiply Units (MXUs). The TPU rasterizer flattens the tile and pixel dimensions into a single massive axis (`[num_tiles, 256]`). The core blending loop (`scan_fn`) processes a single Gaussian across *all pixels in all tiles simultaneously*.
+Kerbl et al. manipulate a logically dynamic set of Gaussians. `jax-gs` instead allocates a static buffer once and uses `active_mask` to distinguish valid from inactive slots. This is the key difference that makes densification JIT-compatible.
+
+### 4.2 Clone/Split/Prune Without Dynamic Resizing
+
+Recent versions of the code perform densification through vectorized routing over padded arrays. Empty destinations and source indices are compacted with `argsort`, then a static `gather_indices` permutation is used to materialize the next state.
 
 ```python
-# From jax_gs/renderer/rasterizer_tpu.py
-# Pre-calculate global pixel coordinates for EVERY pixel in the image, 
-# grouped by tile. Shape: [num_tiles, 256]
+empty_indices = jnp.argsort((~will_be_empty).astype(jnp.int8))
+clone_src_indices = jnp.argsort((~clone_mask).astype(jnp.int8))
+split_src_indices = jnp.argsort((~split_mask).astype(jnp.int8))
+
+idx = jnp.arange(MAX_GAUSSIANS)
+is_clone_dest = idx < num_clones
+is_split_dest = (idx >= num_clones) & (idx < num_clones + num_splits)
+
+src_to_read = jnp.where(is_clone_dest, clone_src_indices[idx], 0)
+src_to_read = jnp.where(is_split_dest, split_src_indices[idx - num_clones], src_to_read)
+
+gather_indices = jnp.arange(MAX_GAUSSIANS)
+gather_indices = gather_indices.at[empty_indices].set(
+    jnp.where(is_clone_dest | is_split_dest, src_to_read, empty_indices)
+)
+```
+
+The point here is not merely functional equivalence. The routing must preserve static shapes so that the same XLA program can execute before and after densification.
+
+### 4.3 Optimizer-State Reordering
+
+One subtle but important recent fix is that densification now reorders the optimizer state along with the Gaussian parameters.
+
+```python
+def reorder_opt_state(opt_state, gather_indices):
+    def reorder_leaf(x):
+        if hasattr(x, "ndim") and x.ndim >= 1 and x.shape[0] == gather_indices.shape[0]:
+            return x[gather_indices]
+        return x
+    return jax.tree_util.tree_map(reorder_leaf, opt_state)
+```
+
+Without this step, Adam moments become attached to the wrong Gaussian after clone/split/prune permutations. That error is easy to miss because the code still runs, but convergence degrades.
+
+### 4.4 Density Heuristics After the Recent Fixes
+
+The recent trainer changes corrected two issues in the density statistics:
+
+1. Positional gradients are rescaled by `W * H * 3` to compensate for loss normalization under `jnp.mean`.
+2. The visibility denominator is updated only for projected active Gaussians.
+
+```python
+grad_2d_mag = jnp.linalg.norm(grads.means, axis=-1) * (z / focal) * (float(W) * float(H) * 3.0)
+
+visible = extras["valid_mask"] & active
+next_denom = state.denom + jnp.where(visible, 1, 0)
+```
+
+This is a JAX-specific correction, not a conceptual change to 3DGS. Kerbl et al. rely on density heuristics calibrated to their own loss and renderer. Once the implementation uses pixel-mean losses and a different compiled execution structure, the heuristic scale must be restored explicitly.
+
+---
+
+## 5. Renderer Design
+
+### 5.1 Tile Assignment and Bit-Packed Sort
+
+Like the original 3DGS pipeline, `jax-gs` uses tile-based culling and front-to-back compositing. The implementation computes Gaussian-to-tile interactions and sorts them with a packed integer key:
+
+```python
+DEPTH_BITS = 13
+sort_tile_ids = jnp.where(valid_interactions, flat_tile_ids, num_tiles_total)
+depth_i32_full = jax.lax.bitcast_convert_type(flat_depths, jnp.int32)
+depth_quant = depth_i32_full >> (31 - DEPTH_BITS)
+key = (sort_tile_ids << DEPTH_BITS) | depth_quant
+sorted_keys, sorted_gaussian_ids = jax.lax.sort_key_val(key, flat_gaussian_ids)
+```
+
+The conceptual role matches Kerbl et al.: group by tile, order by depth, then blend front to back. The difference is that the operation is expressed as pure array primitives rather than a custom CUDA rasterizer.
+
+### 5.2 Standard Rasterizer Path
+
+The standard JAX rasterizer uses nested structure: tile parallelism outside, pixel-level blending inside, and chunked front-to-back accumulation with `lax.scan`.
+
+```python
+def blend_pixel(p_color, p_T, p_coord, p_valid):
+    def scan_fn(inner_carry, i):
+        accum_c, trans = inner_carry
+        is_active = local_mask[i] & (trans > 1e-4)
+        mu = t_means[i]
+        dx = p_coord[0] - mu[0]
+        dy = p_coord[1] - mu[1]
+        power = -0.5 * (dx * dx * t_ic00[i] + dx * dy * t_ic01_2[i] + dy * dy * t_ic11[i])
+        alpha = jnp.exp(power) * t_op_vec[i]
+        alpha = jnp.where((power > -10.0) & is_active, jnp.minimum(0.99, alpha), 0.0)
+        new_T = trans * (1.0 - alpha)
+        new_color = accum_c + (alpha * trans) * t_cols[i]
+        return (new_color, new_T), None
+
+    return jax.lax.scan(scan_fn, (p_color, p_T), jnp.arange(BLOCK_SIZE))[0]
+```
+
+Two current constants matter here:
+
+- `BLOCK_SIZE = 512`
+- `MAX_TILE_CHUNKS = 8`
+
+This yields a hard interaction budget per tile of `4096`. The code now exposes overflow and truncation statistics so training can react when the renderer is under excessive pressure.
+
+### 5.3 TPU Rasterizer Path
+
+For TPUs, the implementation switches to a different execution strategy in `rasterizer_tpu.py`. Tiles and pixels are flattened into `[num_tiles, 256]`, and Gaussian data are gathered in chunks for all tiles simultaneously.
+
+```python
 px = (tx[:, None] * TILE_SIZE).astype(jnp.float32) + (idx % TILE_SIZE)[None, :].astype(jnp.float32) + 0.5
 py = (ty[:, None] * TILE_SIZE).astype(jnp.float32) + (idx // TILE_SIZE)[None, :].astype(jnp.float32) + 0.5
 
 @jax.checkpoint
-def scan_fn(carry, i):
-    # Vectorized across [num_tiles, 256] flat dimension
-    dx = px - mu_x 
-    dy = py - mu_y
-    # ... blending logic ...
+def scan_fn(carry, inputs):
+    c_accum, T = carry
+    mu_x, mu_y, ic00, ic01, ic11, op, cols, is_active_local = inputs
+    dx = px - mu_x[:, None]
+    dy = py - mu_y[:, None]
+    power = -0.5 * (dx * dx * ic00[:, None] + 2.0 * dx * dy * ic01[:, None] + dy * dy * ic11[:, None])
+    alpha = jnp.exp(power) * op[:, None]
+    ...
 ```
 
-2.  **Memory Access Patterns (Random vs. Broadcasted Gather)**:
-    *   **Standard**: Inside the inner loop, it dynamically slices (`jnp.take`) the specific Gaussians that overlap the current tile.
-    *   **TPU**: Dynamic slicing inside a fast loop is terrible for TPU performance. Instead, we use a **Broadcasted Gather**. Before the loop starts, we prefetch *all* Gaussian parameters for *every* tile into massive tensors (e.g., `[num_tiles, BLOCK_SIZE, 3]` for colors).
+This is not simply a faster version of the same code. It is a different memory-access pattern designed for XLA on TPUs:
+
+- larger contiguous tensor operations,
+- fewer random gathers inside the innermost loop,
+- rematerialization via `jax.checkpoint` to control backward memory usage.
+
+### 5.4 View-Dependent Color and Masked Rendering
+
+An older simplification in the renderer used only the DC SH term. The current code evaluates SH up to the active degree and passes the `active_mask` down into projection/rasterization.
 
 ```python
-# From jax_gs/renderer/rasterizer_tpu.py
-# BROADCASTED GATHER: Construct indices for all Gaussians across all tiles.
-# Resulting shape: [num_tiles, BLOCK_SIZE]
-all_tile_indices = tile_starts[:, None] + jnp.arange(BLOCK_SIZE)[None, :]
+means2D, cov2D, radii, valid_mask, depths = project_gaussians(gaussians, camera, mask=mask)
 
-# Prefetch Gaussian data for all tiles at once
-tile_gids = valid_ids[all_tile_indices] 
-g_means = means2D[tile_gids]            # [num_tiles, BLOCK_SIZE, 2]
-g_cols = colors[tile_gids]              # [num_tiles, BLOCK_SIZE, 3]
-
-@jax.checkpoint
-def scan_fn(carry, i):
-    # Processes the i-th Gaussian for ALL pixels in ALL tiles simultaneously
-    # No random access lookups here!
-    mu_x = g_means[:, i, 0][:, None] # [num_tiles, 1]
-    dx = px - mu_x                   # [num_tiles, 256]
-    # ... blending logic ...
+view_dirs = gaussians.means - camera.center
+view_dirs = view_dirs / jnp.linalg.norm(view_dirs, axis=-1, keepdims=True)
+colors = eval_sh(sh_degree, gaussians.sh_coeffs, view_dirs)
+colors = jnp.clip(colors + 0.5, 0.0, 1.0)
 ```
 
-3.  **Memory Efficiency (`jax.checkpoint`)**:
-    *   Because the TPU rasterizer trades memory for speed via the Broadcasted Gather, it risks Out-Of-Memory (OOM) errors during the backward pass (autodiff). We solve this by heavily applying `@jax.checkpoint` to the inner `scan` loop. This forces JAX to discard intermediate activations during the forward pass and recompute them on-the-fly during backpropagation, keeping memory scaling linear rather than exploding.
+This change matters because padded inactive entries are otherwise not just wasted compute; they also perturb density statistics and rasterizer load.
 
 ---
 
-## 9. Scaling Up: Multi-TPU Parallelism
+## 6. Renderer-Health-Gated Training
 
-For larger scenes, we use `jax.pmap` to replicate the model across multiple TPU cores. Each core picks a different random camera, computes local gradients, and performs a collective **all-reduce** to synchronize. This scales our effective batch size linearly with the hardware.
+One of the main recent changes is that the renderer now produces load diagnostics that feed back into scheduling decisions.
 
 ```python
-# From train_parallel.py
-@partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(4, 5, 6, 7, 8))
-def train_block(state, rng_key, all_targets, all_w2cs, ...):
-    # Each device runs its own scan loop
-    (state, rng_key), losses = jax.lax.scan(one_step, (state, rng_key), ...)
-    return state, rng_key, losses
+extras = {
+    "n_interactions": n_interactions,
+    "mean_interactions_per_tile": n_interactions / jnp.maximum(num_tiles, 1),
+    "max_interactions_per_tile": jnp.max(tile_counts),
+    "overflow_tiles": jnp.sum(tile_counts > BLOCK_SIZE),
+    "overflow_interactions": jnp.sum(overflow),
+    "truncated_tiles": jnp.sum(tile_counts > MAX_TILE_INTERACTIONS),
+    "truncated_interactions": jnp.sum(truncated),
+    "radius_cap_violations": radius_cap_violations,
+}
+```
 
-# From jax_gs/training/trainer.py
-# Gradients and metrics are averaged across devices
-grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name='batch'), grads)
-radii_max = jax.lax.pmax(radii_masked, axis_name='batch')
+The training loop then uses these signals to decide whether densification should proceed and whether SH degree promotion should be held back.
+
+```python
+quality_healthy = (
+    block_metrics["overflow_tiles"] <= max_overflow_tiles and
+    block_metrics["overflow_interactions"] <= max_overflow_interactions and
+    block_metrics["radius_cap_violations"] <= max_radius_cap_violations and
+    block_metrics["truncated_tiles"] <= max_truncated_tiles and
+    block_metrics["truncated_interactions"] <= max_truncated_interactions
+)
+
+densify_enabled = quality_healthy and (block_metrics["truncated_tiles"] == 0.0)
+```
+
+This is a genuine difference from the original implementation. Kerbl et al. densify according to geometric and photometric heuristics, but they do not need to regulate training based on a statically budgeted JAX tile pipeline with explicit overflow and truncation thresholds.
+
+The same logic now controls SH promotion:
+
+```python
+desired_sh_degree = min(3, curr_iter // 1000)
+if sh_promotion_mode == "always":
+    next_sh_degree = desired_sh_degree
+elif quality_healthy and desired_sh_degree > curr_sh_degree:
+    next_sh_degree = curr_sh_degree + 1
+else:
+    next_sh_degree = curr_sh_degree
+```
+
+This preserves the spirit of progressive SH fitting from 3DGS while avoiding promotion when the renderer is already overloaded.
+
+---
+
+## 7. Multi-Device Execution
+
+`train_parallel.py` uses `jax.pmap` for data parallelism, but adaptive density control is not applied independently on every replica. Instead, the code unreplicates one authoritative state, performs clone/split/prune once, and then re-replicates the result.
+
+```python
+authoritative_state = unreplicate_tree(curr_state)
+authoritative_state = density_step(authoritative_state, density_rng, densify_enabled)
+curr_state = replicate_tree(authoritative_state, devices)
+```
+
+This is another place where the JAX implementation departs from the original CUDA-oriented setup. The original method is not written around replicated XLA programs, so it does not need an explicit authoritative densification step to keep replicas structurally identical.
+
+Within the per-device training block, gradients and diagnostic summaries are synchronized explicitly:
+
+```python
+grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name="batch"), grads)
+loss = jax.lax.pmean(loss, axis_name="batch")
+metrics = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name="batch"), metrics)
+```
+
+The max-radius update additionally uses `pmax` on masked radii to avoid invalid near-plane projections dominating the statistic.
+
+---
+
+## 8. Comparison to the Original 3DGS Implementation
+
+The table below distinguishes between ideas inherited from Kerbl et al. and implementation changes introduced by `jax-gs`.
+
+| Axis | Kerbl et al. (2023) | Current `jax-gs` |
+| :--- | :--- | :--- |
+| Training stack | PyTorch + custom CUDA rasterization | Pure JAX + XLA, no custom CUDA kernels |
+| Gaussian set representation | Dynamically managed point set | Fixed-capacity padded buffer with `active_mask` |
+| Densification mechanics | Clone/split/prune on dynamic tensors | Clone/split/prune via static gather/scatter routing |
+| Optimizer consistency during densify | Natural under direct tensor mutation | Explicit optimizer-state reordering required |
+| SH color | Progressive SH fitting | Progressive SH fitting with optional health-gated promotion |
+| Rasterization | CUDA tile rasterizer | Pure JAX rasterizer plus TPU-specialized path |
+| Systems feedback into training | Mainly image/loss-driven | Image/loss-driven plus renderer overflow/truncation diagnostics |
+| Multi-device execution | Not formulated as replicated XLA state | `pmap` training with authoritative densify-and-broadcast |
+
+Two clarifications are important:
+
+1. `jax-gs` does not replace the 3DGS algorithm; it re-expresses it under JAX constraints.
+2. Several recent fixes are implementation repairs rather than new modeling contributions. Examples include correct optimizer-state permutation, visibility-aware denominators, and masked max-radius accumulation.
+
+---
+
+## 9. Practical Commands
+
+Single-device training:
+
+```bash
+python train.py \
+  --data_path data/nerf_example_data/nerf_llff_data/fern \
+  --images_subdir images_8 \
+  --fast_tpu_rasterizer \
+  --density_interval 500 \
+  --max_gaussians_growth 8 \
+  --max_gaussians_cap 200000
+```
+
+Multi-device training:
+
+```bash
+python train_parallel.py \
+  --data_path data/nerf_example_data/nerf_llff_data/fern \
+  --images_subdir images_8 \
+  --fast_tpu_rasterizer \
+  --density_interval 500 \
+  --sh_promotion_mode health_gated
+```
+
+CPU-side regression tests:
+
+```bash
+PYTHONPATH=. JAX_PLATFORMS=cpu pytest tests/
 ```
 
 ---
 
 ## 10. Conclusion
 
-By shifting from "Python calling kernels" to "Compiling entire pipelines," we achieved orders of magnitude speed improvements. Gaussian Splatting on TPUs is no longer just a port—it's a highly specialized, hardware-saturated engine.
+The current `jax-gs` implementation should be understood as a static-shape systems reinterpretation of 3D Gaussian Splatting rather than a line-by-line port of the original code. The main technical result is that adaptive density control, SH scheduling, and tile-based splatting can be preserved inside JAX, provided that the implementation is reorganized around padded state, explicit masks, block compilation, and renderer-aware control logic.
 
-**Core Philosophy:**
-1.  **Minimize Dispatch**: Use `jax.lax.scan` for loops.
-2.  **Stay Static**: Use padded buffers and masks for dynamic data.
-3.  **Sync the History**: Keep optimizer moments aligned with parameter movement.
-4.  **Scale the Gradients**: Match densification thresholds to your loss normalization.
-
-With these optimizations, 3DGS training on TPUs is not just incredibly fast—it's mathematically robust and stable on the most complex real-world scenes.
+Relative to Kerbl et al. (2023), the most consequential differences are not the scene representation or objective, but the execution discipline imposed by XLA. Recent updates move the codebase in that direction more rigorously: they restore optimizer correctness after densification, correct the scale of density statistics, prevent inactive slots from leaking into rendering, and regulate training with renderer-health diagnostics. That combination is what makes the current implementation materially more stable than the earlier blog version.

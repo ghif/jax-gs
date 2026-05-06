@@ -33,6 +33,8 @@ def _compute_loss_and_metrics(params, target_image, w2c, camera_static, fast_tpu
         "max_interactions_per_tile": extras["max_interactions_per_tile"].astype(jnp.float32),
         "overflow_tiles": extras["overflow_tiles"].astype(jnp.float32),
         "overflow_interactions": extras["overflow_interactions"].astype(jnp.float32),
+        "truncated_tiles": extras["truncated_tiles"].astype(jnp.float32),
+        "truncated_interactions": extras["truncated_interactions"].astype(jnp.float32),
         "radius_cap_violations": extras["radius_cap_violations"].astype(jnp.float32),
     }
 

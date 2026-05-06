@@ -1,122 +1,249 @@
-# JAX-GS: High-Performance 3D & 2D Gaussian Splatting in Pure JAX
+# JAX-GS
 
-JAX-GS is a fast, hardware-agnostic implementation of 3D and 2D Gaussian Splatting entirely written in JAX. It's designed to saturate Matrix Multiply Units (MXUs) on Google TPUs and Tensor Cores on GPUs by compiling massive training loops into single execution graphs.
+Pure-JAX 3D Gaussian Splatting with tiled rasterization, static-shape adaptive density control, and single-device or multi-device training paths.
 
-## Features
-- **Pure JAX Rasterizer**: No custom CUDA kernels required. Runs efficiently on TPUs, GPUs, and CPUs.
-- **Hardware Agnostic Acceleration**: Supports single-device execution (`jax.jit`) and multi-device data parallelism (`jax.pmap`) for linear scaling.
-- **TPU Saturation**: The entire training loop and data sampling happen on-device, removing Python dispatch overhead and host-device bottlenecks.
-- **2D & 3D Splatting**: Includes parallel modules for standard 3DGS as well as 2DGS (Surfel) representations.
-- **Asynchronous I/O**: Training never stops to wait for disk operations (PLY checkpointing and image saving happen in the background).
+The repository contains:
 
----
+- `jax_gs/`: 3D Gaussian Splatting implementation.
+- `jax_2dgs/`: 2DGS / surfel experiments.
+- `train.py`: single-device 3DGS training.
+- `train_parallel.py`: multi-device data-parallel 3DGS training with `jax.pmap`.
+- `viewer_ply.py`: interactive viewer for saved `.ply` checkpoints.
+- `viewer_random.py`: viewer for randomly generated Gaussians.
+- `tests/`: regression and unit tests.
 
-## 🚀 Getting Started (Tutorial)
+## What Is Current In This Version
 
-Follow this step-by-step tutorial to setup your environment and train your first 3D Gaussian Splatting model.
+The current codebase is centered on the newer JAX-friendly implementation:
 
-### 1. Environment Setup
+- Pure JAX renderer and rasterizer. No custom CUDA kernels.
+- Static-capacity `DensityState` with `active_mask` for JIT-compatible densification.
+- Adaptive clone / split / prune with optimizer-state reordering.
+- Renderer health metrics used to gate densification and SH promotion.
+- Standard rasterizer plus TPU-optimized rasterizer via `--fast_tpu_rasterizer`.
+- Single-device and multi-device training paths using the same core model.
 
-We recommend using `uv` for fast Python environment management. 
+This README is written for the current training scripts. Older experimental scripts, especially `train_fern_resume.py`, are not the recommended entry point.
 
-#### For TPU environments:
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv venv .tpu_env --python 3.11
-source .tpu_env/bin/activate
-uv pip install -r requirements_tpu.txt
-```
+## Requirements
 
-#### For CPU/GPU environments:
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv venv .cpu_env --python 3.11
-source .cpu_env/bin/activate
-uv pip install -r requirements_cpu.txt
-```
+- Python 3.12.x recommended.
+- Conda environment recommended for local development.
+- A COLMAP-format dataset for training.
 
-### 2. Dataset Preparation
-
-JAX-GS natively expects standard COLMAP-formatted datasets (such as the NeRF LLFF datasets). 
-
-1. Download the **Fern** dataset (or use your own custom COLMAP output).
-2. Place it in `data/nerf_example_data/nerf_llff_data/fern`.
-3. Ensure the directory contains an `images/` (or `images_8/`) folder and the COLMAP `sparse/0/` folder.
-
-### 3. Training on a Single Device
-
-To train a model on a single GPU or TPU core, use `train.py`. The script compiles training blocks (e.g., 100-500 steps) to run entirely on the accelerator, making it blazing fast.
+For local work in this repository, the intended environment is:
 
 ```bash
-python train.py --data_path data/nerf_example_data/nerf_llff_data/fern \
-                --images_subdir images_8 \
-                --num_iterations 10000 \
-                --fast_tpu_rasterizer
+conda activate tpu-env
+python --version
 ```
-*(Note: Omit `--fast_tpu_rasterizer` if you are not running on a Google TPU)*
 
-**Outputs will be automatically saved to a timestamped directory in `results/`:** (e.g., `results/fern_3dgs_fast_tpu_YYYYMMDD_HHMMSS/`)
-- Progress renderings: `progress/`
-- Checkpoints: `ply/`
-
-### 4. Training on Multiple Devices (Data Parallelism)
-
-If you have multiple TPU cores (e.g., a TPU v4-8 or v5e pod) or a multi-GPU instance, you can run `train_parallel.py`. This uses `jax.pmap` to replicate the model across devices, processing multiple views concurrently to effectively multiply your batch size.
+Install dependencies:
 
 ```bash
-python train_parallel.py --data_path data/nerf_example_data/nerf_llff_data/fern \
-                         --images_subdir images_8 \
-                         --num_iterations 10000 \
-                         --fast_tpu_rasterizer
+pip install -r requirements_tpu.txt
 ```
 
-### 5. Resuming Training
+If you are setting up a separate CPU-only environment, use `requirements_cpu.txt` instead.
 
-If your training was interrupted or you want to continue optimizing an existing scene, you can resume using `train_fern_resume.py`. This script automatically finds the latest `.ply` checkpoint generated in your `results/` directory and continues training.
+## Dataset Layout
+
+The training scripts expect a COLMAP-style scene directory:
+
+```text
+data/nerf_example_data/nerf_llff_data/fern/
+├── images_8/          # or images/
+└── sparse/
+    └── 0/
+```
+
+The loader is implemented in `jax_gs/io/colmap.py` and is called by both `train.py` and `train_parallel.py`.
+
+## Quick Start
+
+### 1. Single-device training
+
+Use `train.py` for a single GPU, single TPU core, or CPU-based debugging.
 
 ```bash
-python train_fern_resume.py --num_iterations 5000
-```
-*(This adds 5000 iterations to the loaded checkpoint)*
-
-### 6. Visualizing the Results
-
-We include real-time, interactive web viewers built with `viser`. 
-
-To visualize your trained splat checkpoint:
-```bash
-python viewer_ply.py results/fern_3dgs_.../ply/step_...ply
-```
-*Navigate to `http://localhost:8080` in your browser to view and navigate the 3D scene.*
-
-To inspect randomly initialized geometry (helpful for understanding the underlying data structures), run:
-```bash
-python viewer_random.py --num 5000
+python train.py \
+  --data_path data/nerf_example_data/nerf_llff_data/fern \
+  --output_path results \
+  --images_subdir images_8 \
+  --num_iterations 10000
 ```
 
----
-
-## 🛠️ Project Architecture
-
-JAX-GS is architected cleanly with isolated responsibilities, supporting both 3D and 2D Gaussian models:
-
-- `jax_gs/`: Core 3DGS implementation
-  - `core/`: State and mathematical definitions (`Gaussians`, `Camera`).
-  - `renderer/`: Tiled rasterizer, bit-packed sorting, and alpha blending in pure JAX.
-  - `training/`: Loss calculation, JIT-compatible adaptive density control, and optimizer steps.
-  - `io/`: Utilities for PLY and COLMAP reading/writing.
-- `jax_2dgs/`: 2DGS (Surfel) implementation with identical modularity.
-- `docs/`: Technical blogs and architecture details on TPU saturation strategies, optimizations, and benchmarks.
-
-## 🧪 Testing and Quality Assurance
-
-We use `pytest` for unit testing to ensure mathematical correctness and I/O stability across platforms. For deterministic numerical checks, we recommend running the tests on the CPU.
+If you are training on TPU, enable the TPU rasterizer:
 
 ```bash
-JAX_PLATFORMS=cpu PYTHONPATH=. pytest tests/
+python train.py \
+  --data_path data/nerf_example_data/nerf_llff_data/fern \
+  --output_path results \
+  --images_subdir images_8 \
+  --num_iterations 10000 \
+  --fast_tpu_rasterizer
 ```
 
-If you encounter Python path issues, you can explicitly point to the `site-packages` of your active virtual environment:
+### 2. Multi-device training
+
+Use `train_parallel.py` when multiple JAX devices are visible.
+
 ```bash
-JAX_PLATFORMS=cpu PYTHONPATH=.:$(pwd)/.tpu_env/lib/python3.11/site-packages pytest tests/
+python train_parallel.py \
+  --data_path data/nerf_example_data/nerf_llff_data/fern \
+  --output_path results \
+  --images_subdir images_8 \
+  --num_iterations 10000 \
+  --fast_tpu_rasterizer
 ```
+
+This path replicates model state across devices, averages gradients with `pmean`, and performs densification on an authoritative unreplicated state before broadcasting it back to replicas.
+
+### 3. View a trained checkpoint
+
+The trainers save progress images under `progress/` and write a rolling checkpoint at:
+
+```text
+results/<run_name>/ply/<scene_name>_latest.ply
+```
+
+They also save a final checkpoint:
+
+```text
+results/<run_name>/<scene_name>_final.ply
+```
+
+To inspect a saved checkpoint:
+
+```bash
+python viewer_ply.py results/<run_name>/ply/<scene_name>_latest.ply
+```
+
+The viewer starts on port `8080` by default.
+
+### 4. Visualize random Gaussians
+
+```bash
+python viewer_random.py --num 2000
+```
+
+## Training Flags That Matter
+
+Both `train.py` and `train_parallel.py` expose the main controls you will likely tune first:
+
+- `--fast_tpu_rasterizer`: enables the TPU-specialized rasterizer path.
+- `--images_subdir`: choose `images`, `images_2`, `images_4`, `images_8`, etc.
+- `--max_gaussians_cap`: hard upper bound for padded Gaussian capacity.
+- `--max_gaussians_growth`: growth multiplier relative to the initial COLMAP point count.
+- `--density_interval`: frequency of densify / prune passes during the density window.
+- `--max_overflow_tiles`: hold densification / SH promotion if too many tiles spill beyond a single chunk.
+- `--max_overflow_interactions`: same idea, measured by overflow interaction count.
+- `--max_radius_cap_violations`: hold growth when too many splats exceed the tile-span budget.
+- `--max_truncated_tiles`: threshold for hard truncation in the rasterizer.
+- `--max_truncated_interactions`: threshold for truncated interaction count.
+- `--sh_promotion_mode`: `health_gated` or `always`.
+
+Example with the main stability-related flags made explicit:
+
+```bash
+python train.py \
+  --data_path data/nerf_example_data/nerf_llff_data/fern \
+  --output_path results \
+  --images_subdir images_8 \
+  --num_iterations 30000 \
+  --fast_tpu_rasterizer \
+  --density_interval 500 \
+  --max_gaussians_growth 8 \
+  --max_gaussians_cap 200000 \
+  --sh_promotion_mode health_gated
+```
+
+## Outputs
+
+A local run with `--output_path results` creates a directory like:
+
+```text
+results/
+└── fern_3dgs_fast_tpu_YYYYMMDD_HHMMSS/
+    ├── progress/
+    │   ├── progress_1000.png
+    │   ├── progress_2000.png
+    │   └── ...
+    ├── ply/
+    │   └── fern_latest.ply
+    └── fern_final.ply
+```
+
+The rolling `.ply` is intentionally overwritten to keep artifact size manageable.
+
+## Testing
+
+Run tests on CPU unless you are validating accelerator-specific behavior:
+
+```bash
+PYTHONPATH=. JAX_PLATFORMS=cpu pytest tests/
+```
+
+`pytest.ini` currently skips:
+
+- `tests/test_benchmark_3dgs_vs_2dgs.py`
+- `tests/test_gaussians_2d.py`
+
+Run those explicitly if you need them.
+
+## Repository Layout
+
+### Core packages
+
+- `jax_gs/core/`: camera and Gaussian parameter definitions.
+- `jax_gs/renderer/`: projection, SH evaluation, tile interaction building, rasterization.
+- `jax_gs/training/`: losses, train step logic, adaptive density control.
+- `jax_gs/io/`: COLMAP and PLY I/O.
+
+### Scripts
+
+- `train.py`: recommended single-device training path.
+- `train_parallel.py`: recommended multi-device training path.
+- `viewer_ply.py`: interactive viewer for saved checkpoints.
+- `viewer_random.py`: interactive viewer for synthetic Gaussian clouds.
+- `train_fern_resume.py`: older script kept in the repo, not aligned with the current main training pipeline.
+
+### Documentation
+
+- `ARCHITECTURE.md`: architectural overview.
+- `docs/BLOG_EFFICIENT_3DGS.md`: implementation note on the current JAX 3DGS pipeline.
+- `docs/`: additional benchmark and design notes.
+
+## Development Notes
+
+- Keep JAX code vectorized and static-shape friendly where possible.
+- Prefer CPU test runs for deterministic debugging.
+- Generated outputs belong in `results/` or `results_test/` and should not be committed.
+
+## Common Problems
+
+### Training writes to `gs://...` instead of a local directory
+
+Pass `--output_path results` explicitly. The scripts default to a GCS path.
+
+### TPU rasterizer on non-TPU hardware
+
+Do not pass `--fast_tpu_rasterizer` unless you actually want the TPU-optimized path.
+
+### Dataset not found
+
+Double-check:
+
+- `--data_path`
+- `--images_subdir`
+- presence of `sparse/0/` under the scene directory
+
+### No multi-device scaling
+
+Check what JAX sees:
+
+```bash
+python -c "import jax; print(jax.devices())"
+```
+
+`train_parallel.py` only helps when multiple devices are available.

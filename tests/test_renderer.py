@@ -5,7 +5,8 @@ import pytest
 from jax_gs.core.gaussians import init_gaussians_from_pcd
 from jax_gs.core.camera import Camera
 from jax_gs.renderer.projection import project_gaussians
-from jax_gs.renderer.rasterizer import get_tile_interactions, render_tiles, TILE_SIZE
+from jax_gs.renderer.rasterizer import BLOCK_SIZE, TILE_SIZE, get_tile_interactions, render_tiles
+from jax_gs.renderer.rasterizer_tpu import render_tiles_tpu
 
 def test_projection():
     # Setup a single gaussian
@@ -110,3 +111,48 @@ def test_full_render():
     # Center should be red
     assert img_np[32, 32, 0] > 200
     assert img_np[32, 32, 1] < 50
+
+def test_chunked_rasterization_matches_reference():
+    W, H = 16, 16
+    num_gaussians = BLOCK_SIZE + 8
+    means2D = jnp.tile(jnp.array([[8.0, 8.0]], dtype=jnp.float32), (num_gaussians, 1))
+    cov2D = jnp.tile(jnp.array([[[6.0, 0.0], [0.0, 6.0]]], dtype=jnp.float32), (num_gaussians, 1, 1))
+    opacities = jnp.full((num_gaussians, 1), -1.5, dtype=jnp.float32)
+    colors = jnp.stack([
+        jnp.linspace(0.0, 1.0, num_gaussians, dtype=jnp.float32),
+        jnp.linspace(1.0, 0.0, num_gaussians, dtype=jnp.float32),
+        jnp.zeros((num_gaussians,), dtype=jnp.float32),
+    ], axis=-1)
+    sorted_tile_ids = jnp.zeros((num_gaussians,), dtype=jnp.int32)
+    sorted_gaussian_ids = jnp.arange(num_gaussians, dtype=jnp.int32)
+    background = jnp.zeros((3,), dtype=jnp.float32)
+
+    image_std = render_tiles(
+        means2D, cov2D, opacities, colors,
+        sorted_tile_ids, sorted_gaussian_ids,
+        H, W, TILE_SIZE, background
+    )
+    image_tpu = render_tiles_tpu(
+        means2D, cov2D, opacities, colors,
+        sorted_tile_ids, sorted_gaussian_ids,
+        H, W, background
+    )
+
+    center_std = np.array(image_std[8, 8])
+    center_tpu = np.array(image_tpu[8, 8])
+
+    pixel = np.array([8.5, 8.5], dtype=np.float32)
+    mu = np.array([8.0, 8.0], dtype=np.float32)
+    inv_cov = np.linalg.inv(np.array(cov2D[0]))
+    delta = pixel - mu
+    power = -0.5 * float(delta @ inv_cov @ delta)
+    alpha = min(0.99, float(np.exp(power) * jax.nn.sigmoid(opacities[0, 0])))
+    reference = np.zeros(3, dtype=np.float32)
+    transmittance = 1.0
+    for color in np.array(colors):
+        weight = alpha * transmittance
+        reference += weight * color
+        transmittance *= (1.0 - alpha)
+
+    np.testing.assert_allclose(center_std, reference, atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(center_tpu, reference, atol=1e-4, rtol=1e-4)

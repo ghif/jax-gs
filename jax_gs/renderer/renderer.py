@@ -4,6 +4,7 @@ from jax_gs.core.camera import Camera
 from jax_gs.renderer.projection import project_gaussians
 from jax_gs.renderer.rasterizer import (
     BLOCK_SIZE,
+    MAX_TILE_INTERACTIONS,
     OFFSET_SIZE,
     TILE_SIZE,
     get_tile_interactions,
@@ -73,6 +74,7 @@ def render(gaussians: Gaussians, camera: Camera, background=None,
                   ((tile_max_y - tile_min_y + 1) > OFFSET_SIZE)
     radius_cap_violations = jnp.sum(capped_span & valid_mask & on_screen)
     overflow = jnp.maximum(tile_counts - BLOCK_SIZE, 0)
+    truncated = jnp.maximum(tile_counts - MAX_TILE_INTERACTIONS, 0)
     
     extras = {
         "radii": radii,
@@ -82,6 +84,8 @@ def render(gaussians: Gaussians, camera: Camera, background=None,
         "max_interactions_per_tile": jnp.max(tile_counts),
         "overflow_tiles": jnp.sum(tile_counts > BLOCK_SIZE),
         "overflow_interactions": jnp.sum(overflow),
+        "truncated_tiles": jnp.sum(tile_counts > MAX_TILE_INTERACTIONS),
+        "truncated_interactions": jnp.sum(truncated),
         "radius_cap_violations": radius_cap_violations,
     }
     

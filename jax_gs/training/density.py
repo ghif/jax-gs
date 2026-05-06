@@ -98,6 +98,7 @@ def reset_opacities(state: DensityState, reset_val: float = 0.01) -> DensityStat
 def densify_and_prune(
     state: DensityState, 
     rng_key: jax.Array,
+    densify_enabled: bool = True,
     grad_threshold: float = 0.0002, 
     min_opacity: float = 0.005, 
     extent: float = 5.0, # scene radius extent approx
@@ -142,6 +143,7 @@ def densify_and_prune(
     available_slots = jnp.sum(will_be_empty)
     can_densify = total_new <= available_slots
     
+    can_densify = can_densify & densify_enabled
     clone_mask = jnp.where(can_densify, clone_mask, False)
     split_mask = jnp.where(can_densify, split_mask, False)
     num_clones = jnp.sum(clone_mask)

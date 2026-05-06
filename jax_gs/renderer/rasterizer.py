@@ -6,6 +6,8 @@ from typing import Tuple
 TILE_SIZE = 16  # Each tile is 16x16 pixels
 OFFSET_SIZE = 16  # Max tile span tracked per Gaussian in each axis.
 BLOCK_SIZE = 512  # Increased from 192 to 512 to reduce blocky artifacts on datasets with high depth complexity
+MAX_TILE_CHUNKS = 8  # Exact compositing budget per tile in BLOCK_SIZE-sized chunks.
+MAX_TILE_INTERACTIONS = BLOCK_SIZE * MAX_TILE_CHUNKS
 
 def get_tile_interactions(means2D, radii, valid_mask, depths, H, W, tile_size: int = TILE_SIZE):
     """
@@ -166,18 +168,7 @@ def render_tiles(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaus
         """Processes a single 16x16 tile."""
         start_idx = tile_boundaries[tile_idx]
         end_idx = tile_boundaries[tile_idx + 1]
-        count = end_idx - start_idx
-        
-        # Gather the Gaussians for this specific tile.
-        # We process Gaussians in chunks of BLOCK_SIZE for JIT-friendliness.
-        gather_indices = jnp.clip(start_idx + jnp.arange(BLOCK_SIZE), 0, sorted_gaussian_ids.shape[0] - 1)
-        indices = jnp.take(sorted_gaussian_ids, gather_indices)
-        local_mask = (start_idx + jnp.arange(BLOCK_SIZE)) < (start_idx + count)
-        
-        t_means = means2D[indices]
-        t_inv_cov = inv_cov2D[indices]
-        t_ops = sig_opacities[indices]
-        t_cols = colors[indices]
+        count = jnp.minimum(end_idx - start_idx, MAX_TILE_INTERACTIONS)
         
         # Calculate global pixel coordinates for this tile
         ty = tile_idx // num_tiles_x
@@ -190,49 +181,58 @@ def render_tiles(means2D, cov2D, opacities, colors, sorted_tile_ids, sorted_gaus
         pixel_coords = jnp.stack([grid_x, grid_y], axis=-1).reshape(-1, 2)
         pixel_valid = (pixel_coords[:, 0] < W) & (pixel_coords[:, 1] < H)
 
-        # Pre-extract covariance components for optimized math in the inner loop
-        t_ic00 = t_inv_cov[:, 0, 0]
-        t_ic01_2 = 2.0 * t_inv_cov[:, 0, 1]
-        t_ic11 = t_inv_cov[:, 1, 1]
-        t_op_vec = t_ops[:, 0]
-        
         def process_tile():
-            def blend_pixel(p_coord, p_valid):
-                """Alpha-blends all Gaussians for a single pixel."""
-                def scan_fn(carry, i):
-                    accum_color, T = carry
-                    # Early exit if transmittance T is nearly zero (pixel is opaque)
-                    is_active = local_mask[i] & (T > 1e-4)
-                    
-                    mu = t_means[i]
-                    dx = p_coord[0] - mu[0]
-                    dy = p_coord[1] - mu[1]
-                    
-                    # Compute the Gaussian influence at this pixel
-                    power = -0.5 * (dx * dx * t_ic00[i] + dx * dy * t_ic01_2[i] + dy * dy * t_ic11[i])
-                    
-                    alpha = jnp.exp(power) * t_op_vec[i]
-                    # Clamp alpha and mask inactive/far-away Gaussians
-                    alpha = jnp.where((power > -10.0) & is_active, jnp.minimum(0.99, alpha), 0.0)
-                    
-                    # Standard Front-to-Back Blending:
-                    # T_next = T_current * (1 - alpha)
-                    # Color_next = Color_current + T_current * alpha * Color_i
-                    new_T = T * (1.0 - alpha)
-                    new_color = accum_color + (alpha * T) * t_cols[i]
-                    
-                    return (new_color, new_T), None
-                
-                # lax.scan performs the loop efficiently on the device
-                (final_color, final_T), _ = jax.lax.scan(scan_fn, (jnp.zeros(3), 1.0), jnp.arange(BLOCK_SIZE))
-                # Add background color weighted by remaining transmittance
-                final_color = final_color + final_T * background
-                return jnp.where(p_valid, final_color, 0.0)
+            def blend_chunk(carry, chunk_idx):
+                def do_chunk(chunk_carry):
+                    accum_color, T = chunk_carry
+                    chunk_start = start_idx + chunk_idx * BLOCK_SIZE
+                    gather_indices = jnp.clip(
+                        chunk_start + jnp.arange(BLOCK_SIZE),
+                        0,
+                        sorted_gaussian_ids.shape[0] - 1
+                    )
+                    indices = jnp.take(sorted_gaussian_ids, gather_indices)
+                    local_mask = (chunk_idx * BLOCK_SIZE + jnp.arange(BLOCK_SIZE)) < count
 
-            # Parallelize over pixels in the tile
-            tile_image = jax.vmap(blend_pixel)(pixel_coords, pixel_valid)
-            return tile_image.reshape(tile_size, tile_size, 3)
-            
+                    t_means = means2D[indices]
+                    t_inv_cov = inv_cov2D[indices]
+                    t_ops = sig_opacities[indices]
+                    t_cols = colors[indices]
+                    t_ic00 = t_inv_cov[:, 0, 0]
+                    t_ic01_2 = 2.0 * t_inv_cov[:, 0, 1]
+                    t_ic11 = t_inv_cov[:, 1, 1]
+                    t_op_vec = t_ops[:, 0]
+
+                    def blend_pixel(p_color, p_T, p_coord, p_valid):
+                        def scan_fn(inner_carry, i):
+                            accum_c, trans = inner_carry
+                            is_active = local_mask[i] & (trans > 1e-4)
+                            mu = t_means[i]
+                            dx = p_coord[0] - mu[0]
+                            dy = p_coord[1] - mu[1]
+                            power = -0.5 * (dx * dx * t_ic00[i] + dx * dy * t_ic01_2[i] + dy * dy * t_ic11[i])
+                            alpha = jnp.exp(power) * t_op_vec[i]
+                            alpha = jnp.where((power > -10.0) & is_active, jnp.minimum(0.99, alpha), 0.0)
+                            new_T = trans * (1.0 - alpha)
+                            new_color = accum_c + (alpha * trans) * t_cols[i]
+                            return (new_color, new_T), None
+
+                        (next_color, next_T), _ = jax.lax.scan(scan_fn, (p_color, p_T), jnp.arange(BLOCK_SIZE))
+                        next_color = jnp.where(p_valid, next_color, 0.0)
+                        next_T = jnp.where(p_valid, next_T, p_T)
+                        return next_color, next_T
+
+                    return jax.vmap(blend_pixel)(accum_color, T, pixel_coords, pixel_valid)
+
+                return jax.lax.cond(chunk_idx < required_chunks, do_chunk, lambda x: x, carry), None
+
+            c_init = jnp.zeros((pixel_coords.shape[0], 3), dtype=jnp.float32)
+            T_init = jnp.ones((pixel_coords.shape[0],), dtype=jnp.float32)
+            required_chunks = jnp.maximum(1, (count + BLOCK_SIZE - 1) // BLOCK_SIZE)
+            (final_color, final_T), _ = jax.lax.scan(blend_chunk, (c_init, T_init), jnp.arange(MAX_TILE_CHUNKS))
+            final_color = final_color + final_T[:, None] * background
+            return final_color.reshape(tile_size, tile_size, 3)
+
         def empty_tile():
             """Optimization for tiles with no Gaussians."""
             return jnp.broadcast_to(background, (tile_size, tile_size, 3))
