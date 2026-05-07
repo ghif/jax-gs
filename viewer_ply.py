@@ -69,12 +69,17 @@ def load_ply(path):
     opacities = 1.0 / (1.0 + np.exp(-raw_opacities))
     
     # Extract Colors (SH DC) -> Convert to RGB
-    # SH DC 0 is R, DC 1 is G, DC 2 is B
-    # In jax-gs: sh_dc = (color - 0.5) / 0.282...
-    # so color = f_dc * 0.282... + 0.5
+    # In jax-gs: sh_dc = (color - 0.5) / 0.28209479177387814
+    # so color = f_dc * 0.28209479177387814 + 0.5
     f_dc = data[:, [prop_map['f_dc_0'], prop_map['f_dc_1'], prop_map['f_dc_2']]]
     colors = f_dc * 0.28209479177387814 + 0.5
-    colors = np.clip(colors, 0.0, 1.0)
+    
+    # Apply visual heuristic (gamma/contrast correction) to make colors pop
+    # without the full SH evaluation. This brings the visual quality closer 
+    # to the fully rasterized renders.
+    gamma = 1.2
+    colors = np.power(np.clip(colors, 0.0, 1.0), 1.0 / gamma)
+    colors = np.clip(colors * 1.1, 0.0, 1.0) # Slight saturation/brightness bump
     
     # Extract Scales
     scales_data = data[:, [prop_map['scale_0'], prop_map['scale_1'], prop_map['scale_2']]]

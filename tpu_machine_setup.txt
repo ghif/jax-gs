@@ -1,0 +1,37 @@
+# Install Python 3.12
+sudo add-apt-repository ppa:deadsnakes/ppa -y
+sudo apt update
+sudo apt install python3.12 python3.12-venv python3.12-dev -y
+
+# Alternatively, Install Python 3.12 using Conda
+curl -L -O "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
+bash Miniforge3-Linux-x86_64.sh
+source ~/.bashrc
+
+
+
+# Create the environment
+git clone https://github.com/ghif/jax-gs
+cd jax-gs
+
+# Create Conda environment
+conda create -n tpu-env python=3.12
+
+
+# Upgrade pip first to handle modern wheels
+pip install --upgrade pip
+
+# Install JAX with TPU support
+pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+# Install NPM
+sudo apt update
+sudo apt install npm
+
+# Install NVM
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+source ~/.bashrc
+nvm install --lts
+
+# Enter gemini
+npx @google/gemini-cli

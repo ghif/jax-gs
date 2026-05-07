@@ -12,6 +12,20 @@ The repository contains:
 - `viewer_random.py`: viewer for randomly generated Gaussians.
 - `tests/`: regression and unit tests.
 
+## Visual Results
+
+### Training Progress
+These animations show the evolution of the Gaussian Splats during the optimization process.
+
+![Fern Training](results/fern_training.gif)
+
+### Rendered Views
+These are front-facing "wiggle" views generated from the final `.ply` checkpoints.
+
+| Fern (View) | Room (View) |
+| :---: | :---: |
+| ![Fern View](results/fern_viewing.gif) | ![Room View](results/room_viewing.gif) |
+
 ## What Is Current In This Version
 
 The current codebase is centered on the newer JAX-friendly implementation:
@@ -22,8 +36,6 @@ The current codebase is centered on the newer JAX-friendly implementation:
 - Renderer health metrics used to gate densification and SH promotion.
 - Standard rasterizer plus TPU-optimized rasterizer via `--fast_tpu_rasterizer`.
 - Single-device and multi-device training paths using the same core model.
-
-This README is written for the current training scripts. Older experimental scripts, especially `train_fern_resume.py`, are not the recommended entry point.
 
 ## Requirements
 
@@ -45,6 +57,75 @@ pip install -r requirements_tpu.txt
 ```
 
 If you are setting up a separate CPU-only environment, use `requirements_cpu.txt` instead.
+
+## Cloud TPU VM Tutorial
+
+This section covers how to provision, connect, and set up a Google Cloud TPU VM for training.
+
+### 1. Provision a TPU VM (Flex-start)
+
+The most cost-effective way to get high-end TPUs (like Trillium v6e) is using the `flex-start` provisioning model.
+
+```bash
+# Example for a v6e-4 (Trillium) slice
+gcloud alpha compute tpus queued-resources create jax-gs-queue \
+    --zone=southamerica-east1-c \
+    --accelerator-type=v6e-4 \
+    --runtime-version=v2-alpha-tpuv6e \
+    --node-id=my-tpu-node \
+    --provisioning-model=flex-start
+```
+
+Check the status of your request:
+```bash
+gcloud alpha compute tpus queued-resources describe jax-gs-queue --zone=southamerica-east1-c
+```
+
+Once the state is `ACTIVE`, the TPU VM is ready.
+
+### 2. Connect via SSH
+
+Use port forwarding (e.g., `8080`) if you intend to use the interactive PLY viewer on the TPU VM.
+
+```bash
+gcloud compute tpus tpu-vm ssh my-tpu-node \
+    --zone=southamerica-east1-c \
+    --ssh-flag="-L 8080:localhost:8080"
+```
+
+### 3. Machine Setup
+
+Once logged into the TPU VM, set up the environment:
+
+```bash
+# Install Miniforge (Conda)
+curl -L -O "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
+bash Miniforge3-Linux-x86_64.sh
+source ~/.bashrc
+
+# Clone and enter the repo
+git clone https://github.com/ghif/jax-gs
+cd jax-gs
+
+# Create and activate environment
+conda create -n tpu-env python=3.12 -y
+conda activate tpu-env
+
+# Install JAX with TPU support
+pip install "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+# Install project requirements
+pip install -r requirements_tpu.txt
+```
+
+### 4. Verify TPU Access
+
+```bash
+python -c "import jax; print(jax.devices())"
+```
+You should see one or more `TpuDevice` entries.
+
+
 
 ## Dataset Layout
 
@@ -246,4 +327,6 @@ Check what JAX sees:
 python -c "import jax; print(jax.devices())"
 ```
 
-`train_parallel.py` only helps when multiple devices are available.
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
