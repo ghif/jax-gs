@@ -2,6 +2,7 @@ backup/
 data/
 resources/
 results/
+docs/
 __pycache__/
 *.pyc
 .tpu_venv/
