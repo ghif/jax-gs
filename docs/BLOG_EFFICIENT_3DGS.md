@@ -163,6 +163,10 @@ By utilizing `jax.pmap` and `jax.lax.scan`, we achieve near-linear scaling acros
 
 The "Fast TPU Rasterizer" achieves near-peak MXU saturation by replacing irregular memory access patterns with contiguous tensor operations, while `train_parallel.py` effectively hides communication overhead at scale.
 
+## Acknowledgments
+
+Google Cloud credits are provided for this project. #TPUSprint
+
 ## Conclusion
 
 The transformation of 3D Gaussian Splatting into a static-shape, JIT-compatible architecture within JAX enables efficient training and rendering on modern accelerators. By prioritizing systolic array saturation, minimizing host-device communication, and leveraging the low-latency TPU interconnects, `jax-gs` provides a robust and scalable foundation for the next generation of radiance field research.

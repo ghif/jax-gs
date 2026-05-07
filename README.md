@@ -327,6 +327,10 @@ Check what JAX sees:
 python -c "import jax; print(jax.devices())"
 ```
 
+## Acknowledgments
+
+Google Cloud credits are provided for this project. #TPUSprint
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
