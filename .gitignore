@@ -7,3 +7,8 @@ __pycache__/
 *.pyc
 .tpu_venv/
 .worktrees/
+*.sh
+*.ipynb
+test_densify.py
+test_sort.py
+tpu_machine_setup.txt

@@ -1,1 +1,0 @@
-gcloud compute tpus tpu-vm ssh my-tpu-node --zone southamerica-east1-c

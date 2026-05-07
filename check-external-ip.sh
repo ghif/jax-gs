@@ -1,1 +1,0 @@
-gcloud compute tpus tpu-vm describe my-tpu-node --zone=southamerica-east1-c --format="get(networkEndpoints[0].accessConfig.externalIp)"
